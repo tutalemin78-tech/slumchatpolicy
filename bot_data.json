@@ -1,0 +1,41 @@
+{
+  "settings": {
+    "-1004340111525": {
+      "anti_raid": true,
+      "anti_iris": true,
+      "anti_spam": true,
+      "anti_flood": true,
+      "fun": true,
+      "reason": "сын шлюхи",
+      "spam_text": "@glicu\n\nсын шлюхи замучен",
+      "punish_action": "mute",
+      "triggers_enabled": true,
+      "anti_links": false,
+      "anti_bad_words": false
+    }
+  },
+  "chats": {
+    "-1004340111525": "frfrfs"
+  },
+  "iris_ids": {
+    "-1004340111525": [
+      5434504334
+    ]
+  },
+  "stats_daily": {
+    "-1004340111525": {
+      "2026-11-15": {
+        "7383168722": 72,
+        "477250712": 1,
+        "6410323410": 6
+      }
+    }
+  },
+  "pidor_daily": {},
+  "triggers": {
+    "-1004340111525": {
+      "шутка": "не смешно сын бляди"
+    }
+  },
+  "bad_words": {}
+}
