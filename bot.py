@@ -1,5 +1,5 @@
 """
-🛡 АНТИСНОС v9 — Защита от сноса + Моментальный Анти-Ирис + /adda с кнопками + /rev + /add + Триггеры + Справка
+🛡 АНТИСНОС v11 — Защита от сноса + Моментальный Анти-Ирис + Скачивание TikTok + Список рангов /admins + Вечный сервер
 """
 
 import asyncio
@@ -8,10 +8,15 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set
+
+import aiofiles
+import aiohttp
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.enums import ChatMemberStatus, ChatType
@@ -24,6 +29,7 @@ from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
     ChatPermissions,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -83,11 +89,12 @@ class FormStates(StatesGroup):
 # ==================== ДЕФОЛТЫ И СОХРАНЕНИЕ ====================
 def default_settings() -> dict:
     return {
-        "anti_raid": True,        # 3+ бан/кик за 1 мин -> снять права + мут + ответ @glicu
+        "anti_raid": True,        # 5+ бан/кик за 1 мин от админов -> снять права + мут + ответ @glicu
         "anti_iris": True,        # Моментальный съем прав у Ириса при .кик неактив
         "anti_spam": True,        # 10+ медиа за 10 сек -> мут + ответ @glicu
         "anti_flood": True,       # 10+ ПОЛНОСТЬЮ одинаковых сообщений за 10 сек -> мут + ответ @glicu
         "spam_text": "@glicu",    # Настраиваемый текст ответа при рейде/спаме/флуде
+        "tiktok_dl": True,        # Автоскачивание TikTok видео
         "anti_links": False,      # Удаление t.me ссылок от не-админов
         "anti_bad_words": False,  # Удаление запрещенных слов
         "triggers_enabled": True, # Пользовательские триггеры
@@ -136,18 +143,20 @@ async def get_user_status(cid: int, uid: int):
     now = time.time()
     cached = admin_cache.get((cid, uid))
     if cached and now - cached[2] < 15:
-        return cached[0], cached[1]
+        return cached[0], cached[1], cached[3]
     
     try:
         m = await bot.get_chat_member(cid, uid)
         is_creator = m.status == ChatMemberStatus.CREATOR
         is_admin = is_creator or m.status == ChatMemberStatus.ADMINISTRATOR
+        custom_title = getattr(m, "custom_title", "") or ""
     except Exception:
         is_admin = False
         is_creator = False
+        custom_title = ""
         
-    admin_cache[(cid, uid)] = (is_admin, is_creator, now)
-    return is_admin, is_creator
+    admin_cache[(cid, uid)] = (is_admin, is_creator, now, custom_title)
+    return is_admin, is_creator, custom_title
 
 async def demote_admin(cid: int, uid: int) -> bool:
     try:
@@ -248,6 +257,79 @@ def is_user_iris(cid: int, uid: int, username: str = "", name: str = "") -> bool
     return False
 
 
+# ==================== СКАЧИВАНИЕ TIKTOK ====================
+TIKTOK_REGEX = re.compile(r"https?://(?:(?:www|vm|vt|m)\.)?tiktok\.com/[^\s]+")
+
+async def download_tiktok(url: str) -> Optional[str]:
+    api_url = "https://www.tikwm.com/api/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(api_url, data={"url": url, "hd": "1"}, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+                data = await resp.json()
+                if data.get("code") != 0:
+                    return None
+                video_url = data.get("data", {}).get("hdplay") or data.get("data", {}).get("play")
+                if not video_url:
+                    return None
+                vid_id = data.get("data", {}).get("id", str(int(time.time())))
+                filename = f"tt_{vid_id}_{random.randint(1000, 9999)}.mp4"
+                async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
+                    if video_resp.status != 200:
+                        return None
+                    async with aiofiles.open(filename, "wb") as f:
+                        async for chunk in video_resp.content.iter_chunked(8192):
+                            await f.write(chunk)
+                return filename
+    except Exception as e:
+        log.error(f"Error downloading TikTok ({url}): {e}")
+        return None
+
+
+# ==================== КОМАНДА /admins — СПИСОК АДМИНОВ И РАНГОВ ====================
+@router.message(Command("admins", "админы", "ранги"))
+async def cmd_admins_list(m: Message):
+    if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await m.reply("команда работает только в чате")
+        return
+
+    cid = m.chat.id
+    try:
+        admins = await bot.get_chat_administrators(cid)
+    except Exception as e:
+        await m.reply(f"⚠️ не смог получить список админов: {e}")
+        return
+
+    lines = ["👑 <b>Список администрации и рангов в чате:</b>\n"]
+    for i, a in enumerate(admins, 1):
+        u = a.user
+        name = u.first_name or f"id{u.id}"
+        un = f"@{u.username}" if u.username else f"id:{u.id}"
+        
+        # Определяем статус
+        if a.status == ChatMemberStatus.CREATOR:
+            rank = "👑 Создатель (Владелец чата)"
+        else:
+            title = getattr(a, "custom_title", "")
+            if title:
+                rank = f"⭐️ [{title}] (Старший админ / 4 ранг)"
+            else:
+                rank = "🛡 Администратор"
+
+        bot_mark = " 🤖 [БОТ]" if u.is_bot else ""
+        if u.id in KNOWN_IRIS_IDS or (u.username and "iris" in u.username.lower()):
+            bot_mark = " 🤖 [ИРИС ЧАТ-МЕНЕДЖЕР]"
+        elif u.id == BOT_ID:
+            bot_mark = " 🛡 [НАШ БОТ-ЗАЩИТНИК]"
+
+        lines.append(f"{i}. <b>{name}</b> ({un}){bot_mark}\n   └ Ранг: <code>{rank}</code>")
+
+    lines.append("\n<i>Бот отслеживает всех старших админов (4 ранг) и готов снять права при 5+ спаме бан/кик.</i>")
+    await m.reply("\n".join(lines), parse_mode="HTML")
+
+
 # ==================== КЛАВИАТУРА ПРАВ АДМИНИСТРАТОРА (/adda) ====================
 async def get_admin_perms_dict(cid: int, uid: int) -> Dict[str, bool]:
     try:
@@ -305,12 +387,10 @@ def kb_admin_panel(cid: int, uid: int, p: Dict[str, bool]) -> InlineKeyboardMark
 # ==================== КОМАНДЫ /adda, /add, /addg, /rev ====================
 @router.message(Command("adda"))
 async def cmd_adda_handler(m: Message):
-    """Выдает префикс и открывает панель настройки прав с кнопками"""
     if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await m.reply("команда работает только в чате")
         return
 
-    # ТОЛЬКО OWNER_ID
     if m.from_user.id != OWNER_ID:
         return
 
@@ -322,18 +402,15 @@ async def cmd_adda_handler(m: Message):
     cid = m.chat.id
     target_name = target_user.first_name or f"id{target_user.id}"
 
-    # Парсим префикс
     raw = m.text.split(maxsplit=1)
     prefix = raw[1].strip()[:16] if len(raw) > 1 else "Админ"
 
     try:
-        # Проверяем статус целевого юзера
         target_cm = await bot.get_chat_member(cid, target_user.id)
         if target_cm.status == ChatMemberStatus.CREATOR:
             await m.reply("⚠️ это Создатель чата, ему нельзя менять права через бота!")
             return
 
-        # Назначаем админом с минимальными правами (инвайты)
         await bot.promote_chat_member(
             chat_id=cid,
             user_id=target_user.id,
@@ -348,7 +425,6 @@ async def cmd_adda_handler(m: Message):
             can_manage_topics=False,
         )
 
-        # Ставим кастомный префикс
         if not target_user.is_bot:
             try:
                 await bot.set_chat_administrator_custom_title(cid, target_user.id, prefix)
@@ -391,7 +467,6 @@ async def cmd_adda_handler(m: Message):
 
 @router.callback_query(F.data.startswith("adm_p:"))
 async def cb_toggle_admin_perm(cb: CallbackQuery):
-    """Переключение отдельного права админа на инлайн-панели"""
     if cb.from_user.id != OWNER_ID:
         await cb.answer("только овнер может менять права", show_alert=True)
         return
@@ -419,7 +494,6 @@ async def cb_toggle_admin_perm(cb: CallbackQuery):
             "can_manage_video_chats": current_p["video"],
             "is_anonymous": current_p["anon"],
         }
-        # topics передаем только если есть
         if current_p["topics"]:
             kwargs["can_manage_topics"] = True
 
@@ -430,7 +504,7 @@ async def cb_toggle_admin_perm(cb: CallbackQuery):
             await cb.message.edit_reply_markup(reply_markup=kb_admin_panel(cid, uid, current_p))
         except TelegramBadRequest as e:
             if "message is not modified" in e.message.lower():
-                pass # игнорируем ошибку одинакового контента
+                pass
             else:
                 raise e
 
@@ -441,7 +515,6 @@ async def cb_toggle_admin_perm(cb: CallbackQuery):
         if "message is not modified" in e.message.lower():
             await cb.answer()
         elif "RIGHT_FORBIDDEN" in e.message or "NOT_ENOUGH_RIGHTS" in e.message:
-            # Откатываем значение обратно
             current_p[perm_key] = not new_val
             await cb.answer("⚠️ Telegram не даёт выдать это право (у нашего бота нет этой галочки)", show_alert=True)
         else:
@@ -453,7 +526,6 @@ async def cb_toggle_admin_perm(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_revoke:"))
 async def cb_admin_revoke(cb: CallbackQuery):
-    """Кнопка 'Снять' на панели прав"""
     if cb.from_user.id != OWNER_ID:
         await cb.answer("только овнер", show_alert=True)
         return
@@ -473,7 +545,6 @@ async def cb_admin_revoke(cb: CallbackQuery):
 
 @router.message(Command("rev", "разжаловать", "снять"))
 async def cmd_revoke_handler(m: Message):
-    """Команда /rev: забирает префикс и все права админа"""
     if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
@@ -506,7 +577,6 @@ async def cmd_revoke_handler(m: Message):
 
 @router.message(Command("add", "addg"))
 async def handle_cmd_add_simple(m: Message):
-    """Выдает серый префикс без прав (только инвайты)"""
     if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
@@ -595,10 +665,11 @@ class GlobalShieldMiddleware(BaseMiddleware):
         str_uid = str(uid)
         db["stats_daily"][str_cid][today][str_uid] = db["stats_daily"][str_cid][today].get(str_uid, 0) + 1
 
-        is_admin, is_creator = await get_user_status(cid, uid)
+        is_admin, is_creator, custom_title = await get_user_status(cid, uid)
 
         # -------------------------------------------------------------
         # 1. МОМЕНТАЛЬНЫЙ АНТИ-ИРИС: .кик неактив / !кик неактив
+        # Удаляет команду сноса + забирает права у Ириса
         # -------------------------------------------------------------
         if cfg["anti_iris"] and m.text:
             text_clean = m.text.lower().strip()
@@ -607,32 +678,42 @@ class GlobalShieldMiddleware(BaseMiddleware):
             ) or (
                 "кик неактив" in text_clean
             ):
+                # Мгновенно удаляем саму команду сноса, чтобы Ирис её не прочитал!
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+
+                # Моментально отбираем права у Ириса
                 success = await revoke_all_iris(cid)
                 iris_alert[cid] = time.time()
                 log.info(f"[{cid}] ОБНАРУЖЕНА КОМАНДА СНОСА: '{m.text}' -> Снятие прав с Ириса: {success}")
+                
                 if success:
                     try:
-                        await m.reply("🛡 забрал права у ириса. снос неактива заблокирован на корню.")
+                        await bot.send_message(cid, "🛡 команда сноса удалена! права у ириса сняты.")
                     except Exception:
                         pass
                 else:
                     try:
-                        await m.reply("⚠️ обнаружен снос неактива! (если ирис не снялся, убедись что он назначен через /adda нашего бота)")
+                        await bot.send_message(cid, "🛡 команда сноса удалена! снос предотвращён.")
                     except Exception:
                         pass
+
                 await notify_owner(
                     f"🛑 <b>ПРЕДОТВРАЩЁН СНОС НЕАКТИВА!</b>\n"
                     f"Чат: «{chat_title}»\n"
                     f"Кто написал: {user_name} ({username_str})\n"
-                    f"Команда: <code>{m.text}</code>\n"
+                    f"Команда: <code>{m.text}</code> (удалена)\n"
                     f"Статус снятия прав с Ириса: {success}"
                 )
-                return False
+                return True # блокируем дальнейшую обработку сообщения
 
         # -------------------------------------------------------------
-        # 2. АНТИРЕЙД: БАН / КИК (3+ раза за 1 минуту)
+        # 2. АНТИРЕЙД: БАН / КИК (5+ раз за 1 мин) ТОЛЬКО ОТ АДМИНОВ В ЧАТЕ!
+        # Обычных участников не трогает!
         # -------------------------------------------------------------
-        if cfg["anti_raid"] and m.text:
+        if cfg["anti_raid"] and m.text and is_admin:
             text_low = m.text.lower()
             now = time.time()
             triggered = False
@@ -642,7 +723,7 @@ class GlobalShieldMiddleware(BaseMiddleware):
                 count_ban = text_low.count("бан")
                 ban_tracker[cid][uid].extend([now] * count_ban)
                 ban_tracker[cid][uid] = clean_timestamps(ban_tracker[cid][uid], 60)
-                if len(ban_tracker[cid][uid]) >= 3:
+                if len(ban_tracker[cid][uid]) >= 5:
                     triggered = True
                     word = "бан"
                     ban_tracker[cid][uid].clear()
@@ -651,7 +732,7 @@ class GlobalShieldMiddleware(BaseMiddleware):
                 count_kick = text_low.count("кик")
                 kick_tracker[cid][uid].extend([now] * count_kick)
                 kick_tracker[cid][uid] = clean_timestamps(kick_tracker[cid][uid], 60)
-                if len(kick_tracker[cid][uid]) >= 3:
+                if len(kick_tracker[cid][uid]) >= 5:
                     triggered = True
                     word = "кик"
                     kick_tracker[cid][uid].clear()
@@ -666,21 +747,22 @@ class GlobalShieldMiddleware(BaseMiddleware):
                         f"🚨 <b>ТЕСТ РЕЙДА (Создатель чата)</b>\n"
                         f"Чат: «{chat_title}»\n"
                         f"От: {user_name} ({username_str})\n"
-                        f"Слово '{word}' 3+ раз за 1 мин."
+                        f"Слово '{word}' 5+ раз за 1 мин."
                     )
                 else:
-                    await demote_admin(cid, uid)
-                    await mute_user_forever(cid, uid)
+                    demote_ok = await demote_admin(cid, uid)
+                    mute_ok = await mute_user_forever(cid, uid)
                     try:
                         await m.reply(spam_reply_text)
                     except Exception:
                         pass
                     await notify_owner(
-                        f"🚨 <b>ПРЕДОТВРАЩЁН РЕЙД (СНЯТ И ЗАМУЧЕН)</b>\n"
+                        f"🚨 <b>ПРЕДОТВРАЩЁН РЕЙД СТАРШЕГО АДМИНА!</b>\n"
                         f"Чат: «{chat_title}»\n"
-                        f"Нарушитель: {user_name} ({username_str}) [ID: <code>{uid}</code>]\n"
-                        f"Триггер: 3+ раз слово '{word}' за 1 минуту\n"
-                        f"Действие: Сняты все права + МУТ навсегда, ответ в чат: {spam_reply_text}"
+                        f"Админ: {user_name} ({username_str}) [ID: <code>{uid}</code>]\n"
+                        f"Ранг/Титул: {custom_title or 'Админ'}\n"
+                        f"Триггер: 5+ раз слово '{word}' за 1 минуту\n"
+                        f"Действие: Сняты все права ({demote_ok}) + МУТ навсегда ({mute_ok}), ответ в чат: {spam_reply_text}"
                     )
                 return True
 
@@ -746,7 +828,16 @@ class GlobalShieldMiddleware(BaseMiddleware):
                 return True
 
         # -------------------------------------------------------------
-        # 5. АНТИ-ССЫЛКИ
+        # 5. СКАЧИВАНИЕ TIKTOK ВИДЕО БЕЗ ВОДЯНОГО ЗНАКА
+        # -------------------------------------------------------------
+        if cfg.get("tiktok_dl", True) and m.text:
+            match = TIKTOK_REGEX.search(m.text)
+            if match:
+                tt_url = match.group(0)
+                asyncio.create_task(handle_tiktok_message(m, tt_url))
+
+        # -------------------------------------------------------------
+        # 6. АНТИ-ССЫЛКИ
         # -------------------------------------------------------------
         if cfg.get("anti_links") and m.text and not is_admin:
             lo = m.text.lower()
@@ -758,7 +849,7 @@ class GlobalShieldMiddleware(BaseMiddleware):
                 return True
 
         # -------------------------------------------------------------
-        # 6. ЗАПРЕЩЁННЫЕ СЛОВА
+        # 7. ЗАПРЕЩЁННЫЕ СЛОВА
         # -------------------------------------------------------------
         if cfg.get("anti_bad_words") and m.text and not is_admin:
             bad_list = db.get("bad_words", {}).get(str_cid, [])
@@ -772,7 +863,7 @@ class GlobalShieldMiddleware(BaseMiddleware):
                     return True
 
         # -------------------------------------------------------------
-        # 7. ПОЛЬЗОВАТЕЛЬСКИЕ ТРИГГЕРЫ (АВТООТВЕТЫ)
+        # 8. ПОЛЬЗОВАТЕЛЬСКИЕ ТРИГГЕРЫ (АВТООТВЕТЫ)
         # -------------------------------------------------------------
         if cfg.get("triggers_enabled", True) and m.text:
             triggers = db.get("triggers", {}).get(str_cid, {})
@@ -788,6 +879,25 @@ class GlobalShieldMiddleware(BaseMiddleware):
         return False
 
 dp.message.outer_middleware(GlobalShieldMiddleware())
+
+
+async def handle_tiktok_message(m: Message, url: str):
+    """Скачивает и отправляет TikTok видео реплаем"""
+    try:
+        video_file = await download_tiktok(url)
+        if video_file and os.path.exists(video_file):
+            try:
+                await m.reply_video(
+                    video=FSInputFile(video_file),
+                    caption="🎬 TikTok без водяного знака"
+                )
+            except Exception as e:
+                log.error(f"Error sending tiktok video: {e}")
+            finally:
+                if os.path.exists(video_file):
+                    os.remove(video_file)
+    except Exception as e:
+        log.error(f"handle_tiktok_message error: {e}")
 
 
 # ==================== ДЕТЕКТ СНОСА В CHAT MEMBER UPDATE ====================
@@ -871,7 +981,7 @@ def kb_chat_panel(chat_id: int) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=f"🛡 Рейд (бан/кик 3х): {icon(cfg['anti_raid'])}", callback_data=f"tog:{str_cid}:anti_raid"),
+            InlineKeyboardButton(text=f"🛡 Рейд админов (5х): {icon(cfg['anti_raid'])}", callback_data=f"tog:{str_cid}:anti_raid"),
             InlineKeyboardButton(text=f"🛑 Анти-Ирис: {icon(cfg['anti_iris'])}", callback_data=f"tog:{str_cid}:anti_iris"),
         ],
         [
@@ -879,11 +989,12 @@ def kb_chat_panel(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"🔄 Антифлуд 10х: {icon(cfg['anti_flood'])}", callback_data=f"tog:{str_cid}:anti_flood"),
         ],
         [
-            InlineKeyboardButton(text=f"🔗 Анти-ссылки: {icon(cfg.get('anti_links', False))}", callback_data=f"tog:{str_cid}:anti_links"),
-            InlineKeyboardButton(text=f"🤬 Запретка: {icon(cfg.get('anti_bad_words', False))}", callback_data=f"tog:{str_cid}:anti_bad_words"),
+            InlineKeyboardButton(text=f"🎬 Скачивание TikTok: {icon(cfg.get('tiktok_dl', True))}", callback_data=f"tog:{str_cid}:tiktok_dl"),
+            InlineKeyboardButton(text=f"🎉 Веселье: {icon(cfg['fun'])}", callback_data=f"tog:{str_cid}:fun"),
         ],
         [
-            InlineKeyboardButton(text=f"🎉 Веселье (игры/троллинг): {icon(cfg['fun'])}", callback_data=f"tog:{str_cid}:fun"),
+            InlineKeyboardButton(text=f"🔗 Анти-ссылки: {icon(cfg.get('anti_links', False))}", callback_data=f"tog:{str_cid}:anti_links"),
+            InlineKeyboardButton(text=f"🤬 Запретка: {icon(cfg.get('anti_bad_words', False))}", callback_data=f"tog:{str_cid}:anti_bad_words"),
         ],
         [
             InlineKeyboardButton(text=f"💬 Ответ при спаме: [{cfg.get('spam_text', '@glicu')}]", callback_data=f"set_spam_text:{str_cid}"),
@@ -938,20 +1049,24 @@ async def cb_refresh_chats(cb: CallbackQuery):
 async def cb_help_manual(cb: CallbackQuery):
     manual = (
         "📖 <b>ПОЛНОЕ ОПИСАНИЕ ВСЕХ ВОЗМОЖНОСТЕЙ БОТА:</b>\n\n"
-        "🛡 <b>1. Антирейд (бан/кик 3х):</b>\n"
-        "— 3+ слова 'бан' или 'кик' за 1 минуту -> бот тихо снимает админку, мутит навсегда и отвечает реплаем текстом (по умолчанию <code>@glicu</code>).\n\n"
+        "🛡 <b>1. Антирейд админов (бан/кик 5х):</b>\n"
+        "— Если админ чата (старший админ/4 ранг Ириса) пишет 'бан' или 'кик' 5+ раз за 1 минуту: бот тихо снимает с него все права админа, мутит навсегда и отвечает реплаем <code>@glicu</code>.\n"
+        "— Обычных участников эта проверка не трогает!\n\n"
         "🛑 <b>2. Анти-Ирис (кик неактив):</b>\n"
-        "— Команда <code>.кик неактив</code> -> бот МОМЕНТАЛЬНО снимает права с Ириса до того, как он кого-то кикнет!\n"
-        "<i>(Важно: Ирис должен быть назначен админом через команду нашего бота /adda Ирис, чтобы у бота было право снять его!)</i>\n\n"
-        "📸 <b>3. Антиспам медиа:</b>\n"
+        "— При команде <code>.кик неактив</code> бот МОМЕНТАЛЬНО удаляет команду и снимает права с Ириса до того, как он успеет кого-то кикнуть!\n\n"
+        "👑 <b>3. Список админов и рангов:</b>\n"
+        "— Команда <code>/admins</code> (в чате) показывает всех админов, ранги и кастомные титулы.\n\n"
+        "🎬 <b>4. Скачивание TikTok:</b>\n"
+        "— Отправляешь ссылку на TikTok в чат — бот скачивает видео БЕЗ водяного знака и шлет видео файлом прямо в чат!\n\n"
+        "📸 <b>5. Антиспам медиа:</b>\n"
         "— 10+ стикеров, гифок или фото за 10 сек -> мут + ответ реплаем <code>@glicu</code>.\n\n"
-        "🔄 <b>4. Антифлуд одинаковыми:</b>\n"
+        "🔄 <b>6. Антифлуд одинаковыми:</b>\n"
         "— 10+ ПОЛНОСТЬЮ одинаковых сообщений за 10 сек -> мут + ответ <code>@glicu</code>. Разные сообщения не мутит!\n\n"
-        "👑 <b>5. Команды админов:</b>\n"
-        "— <code>/adda [префикс]</code> (реплаем) — интерактивная панель настройки прав админа кнопками.\n"
+        "👑 <b>7. Команды админов (только для тебя):</b>\n"
+        "— <code>/adda [префикс]</code> (реплаем) — интерактивная панель настройки прав кнопками.\n"
         "— <code>/add [префикс]</code> (реплаем) — серый префикс без прав.\n"
         "— <code>/rev</code> (реплаем) — моментально забрать все права и префикс.\n\n"
-        "🎉 <b>6. Троллинг-команды в чате:</b>\n"
+        "🎉 <b>8. Троллинг-команды в чате:</b>\n"
         "— /пидор, /шип, /гей, /шлюха, /айкью, /хуй, /дуэль, /казнь, /кто, /инфа, /шар, /typers."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1416,6 +1531,7 @@ async def cmd_help(m: Message):
     if m.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await m.reply(
             "🎮 команды:\n"
+            "/admins — список админов и рангов в чате\n"
             "/adda [префикс] — панель настройки прав (кнопками)\n"
             "/add [префикс] — выдать префикс без прав\n"
             "/rev — снять префикс и все права\n"
@@ -1429,6 +1545,22 @@ async def cmd_help(m: Message):
 @router.message()
 async def dummy_message_handler(m: Message):
     pass
+
+
+# ==================== ВЕБ-СЕРВЕР ДЛЯ ВЕЧНОЙ ЖИЗНИ (RENDER ANTI-SLEEP) ====================
+async def health_check_handler(request):
+    return web.Response(text="Bot is ALIVE 24/7!", status=200)
+
+async def start_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/health", health_check_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"🌐 Anti-Sleep Web Server запущен на порту {port}")
 
 
 # ==================== ЗАПУСК ====================
@@ -1446,12 +1578,17 @@ async def main():
     log.info(f"🚀 Бот запущен: @{BOT_USERNAME} [ID: {BOT_ID}]")
 
     try:
+        await start_web_server()
+    except Exception as e:
+        log.warning(f"Could not start anti-sleep web server: {e}")
+
+    try:
         await bot.send_message(
             OWNER_ID,
-            f"🟢 <b>Бот @{BOT_USERNAME} v9 готов!</b>\n"
-            f"• Исправлены ошибки message is not modified.\n"
-            f"• Добавлена понятная обработка прав Ириса и Создателя.\n"
-            f"• Готов к деплою на Render."
+            f"🟢 <b>Бот @{BOT_USERNAME} v11 запущен и готов!</b>\n"
+            f"• Добавлена команда /admins (ранги и админы чата).\n"
+            f"• Моментальное удаление команды сноса неактива.\n"
+            f"• Автоскачивание TikTok активно."
         )
     except Exception as e:
         log.warning(f"Could not send startup message to owner: {e}")
