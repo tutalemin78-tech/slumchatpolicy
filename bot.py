@@ -1,5 +1,5 @@
 """
-🛡 АНТИСНОС v13 — Идеальная защита без единого бага и без ложных срабатываний
+🛡 АНТИСНОС v14 — Идеальная защита без единого бага и без ложных срабатываний
 • ГИФКИ, ФОТО, ВИДЕО, КРУЖКИ: ПОЛНЫЙ ИММУНИТЕТ, БОТ ИХ НЕ ТРОГАЕТ ВООБЩЕ НИКОГДА!
 • Мут ТОЛЬКО за:
   1) ОДИН И ТОТ ЖЕ ТЕКСТ (>10 раз за 10 сек) -> мут на 10 минут, реплай:
@@ -17,14 +17,17 @@
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
 import random
 import re
+import shutil
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import aiofiles
@@ -40,6 +43,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatJoinRequest,
     ChatMemberUpdated,
     ChatPermissions,
     FSInputFile,
@@ -51,11 +55,21 @@ from aiogram.types import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("antisnos")
+esc = html.escape  # экранирование всего, что вставляется в HTML-сообщения
 
 # ==================== КОНФИГУРАЦИЯ ====================
-TOKEN = "9061771688:AAHW0RbE_PkIZdUbAkJfOeyqAWJrti4cq8g"
-OWNER_ID = 7383168722
-DATA_FILE = "bot_data.json"
+# Секреты и пути — ТОЛЬКО из переменных окружения (токен в коде хранить нельзя!)
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("Не задана переменная окружения BOT_TOKEN (токен от @BotFather)")
+OWNER_ID = int(os.getenv("OWNER_ID", "7383168722"))
+DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
+RAID_REPLY = os.getenv("RAID_REPLY", "@glicu")  # что бот пишет при пресечении рейда админа
+MASS_KICK_LIMIT = int(os.getenv("MASS_KICK_LIMIT", "3"))  # сколько киков/банов подряд = снос
+MASS_KICK_WINDOW = float(os.getenv("MASS_KICK_WINDOW", "10"))  # за сколько секунд
+
+ANON_ADMIN_ID = 1087968824  # GroupAnonymousBot
+CHANNEL_FWD_ID = 777000     # автопересылка из канала
 
 KNOWN_IRIS_IDS = {5434504334}
 KNOWN_IRIS_USERNAMES = {
@@ -96,12 +110,51 @@ kick_word_tracker = defaultdict(lambda: defaultdict(list))
 iris_alert = {}
 admin_kicks = defaultdict(lambda: defaultdict(list))
 admin_cache = {}
+recent_demote: Dict[Tuple[int, int], float] = {}  # (chat, user) -> monotonic: не снимать права по 100 раз подряд
+join_tracker = defaultdict(list)                  # chat -> [monotonic] заявки на вступление
+join_pause_until: Dict[int, float] = {}           # chat -> monotonic: пауза автопринятия (щит)
+notice_sent: Dict[Tuple[int, str], float] = {}    # антиспам служебных уведомлений владельцу
+fun_cooldown: Dict[Tuple[int, int], float] = {}
+trigger_cooldown: Dict[Tuple[int, str], float] = {}
+tiktok_cooldown: Dict[int, float] = {}
+name_cache: Dict[Tuple[int, int], Tuple[str, float]] = {}
+_bg_tasks: set = set()
+_tiktok_sem: Optional[asyncio.Semaphore] = None
+
+JOIN_DELAYS = [0, 1, 3, 5, 10, 30]  # варианты задержки автопринятия (сек), листаются кнопкой
+JOIN_SHIELD_LIMIT = 15              # столько заявок...
+JOIN_SHIELD_WINDOW = 30             # ...за столько секунд = рейд заявок
+JOIN_SHIELD_PAUSE = 600             # на сколько секунд ставим автопринятие на паузу
+
+# Какие переключатели вообще разрешено менять кнопками
+TOGGLE_KEYS = {
+    "anti_raid", "anti_iris", "anti_flood_text", "anti_flood_sticker", "tiktok_dl", "fun",
+    "anti_links", "anti_bad_words", "triggers_enabled",
+    "auto_approve", "join_shield", "welcome", "clean_service", "notify_owner",
+}
+
+
+def spawn(coro) -> "asyncio.Task":
+    """create_task с удержанием ссылки (иначе задачу может собрать GC на полпути)."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
+
+def get_tiktok_sem() -> asyncio.Semaphore:
+    global _tiktok_sem
+    if _tiktok_sem is None:
+        _tiktok_sem = asyncio.Semaphore(2)
+    return _tiktok_sem
+
 
 class FormStates(StatesGroup):
     waiting_for_spam_text = State()
     waiting_for_trigger_word = State()
     waiting_for_trigger_reply = State()
     waiting_for_bad_word = State()
+    waiting_for_welcome_text = State()
 
 
 # ==================== ДЕФОЛТЫ И СОХРАНЕНИЕ ====================
@@ -116,6 +169,13 @@ def default_settings() -> dict:
         "anti_bad_words": False,    # Удаление запрещенных слов
         "triggers_enabled": True,   # Пользовательские триггеры
         "fun": True,                # Веселье
+        "auto_approve": True,       # Автопринятие заявок на вступление
+        "approve_delay": 1,         # Через сколько секунд принимать заявку (0 = сразу)
+        "join_shield": True,        # Пауза автопринятия при наплыве заявок (рейд)
+        "welcome": False,           # Приветствие новичков
+        "welcome_text": "👋 Добро пожаловать, {name}!",
+        "clean_service": False,     # Удалять служебные «вступил/вышел»
+        "notify_owner": True,       # Присылать владельцу отчёты о срабатываниях
     }
 
 def get_chat_cfg(chat_id: int) -> dict:
@@ -128,22 +188,42 @@ def get_chat_cfg(chat_id: int) -> dict:
     return db["settings"][cid]
 
 def save_data():
+    """Атомарная запись: сначала во временный файл, потом замена (сбой посреди записи не убьёт базу)."""
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, DATA_FILE)
     except Exception as e:
         log.error(f"Error saving data: {e}")
 
 def load_data():
     global db
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                for k in ["settings", "chats", "iris_ids", "stats_daily", "pidor_daily", "triggers", "bad_words", "iris_ranks"]:
-                    db[k] = loaded.get(k, {})
-        except Exception as e:
-            log.error(f"Error loading data: {e}")
+    if not os.path.exists(DATA_FILE):
+        return
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError("корень JSON не объект")
+        for k in ["settings", "chats", "iris_ids", "stats_daily", "pidor_daily", "triggers", "bad_words", "iris_ranks"]:
+            db[k] = loaded.get(k, {})
+    except Exception as e:
+        log.error(f"Error loading data: {e}")
+        try:  # битый файл не затираем молча — сохраняем копию
+            shutil.copy(DATA_FILE, DATA_FILE + ".corrupt")
+            log.error(f"Копия повреждённой базы: {DATA_FILE}.corrupt")
+        except Exception:
+            pass
+
+def prune_stats(keep_days: int = 14):
+    """Статистика по дням не должна расти бесконечно."""
+    cutoff = (datetime.now(timezone.utc) + timedelta(hours=3) - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    for days in db.get("stats_daily", {}).values():
+        for day in [d for d in days if d < cutoff]:
+            del days[day]
 
 def get_today_str() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
@@ -154,6 +234,23 @@ async def notify_owner(text: str):
     except Exception as e:
         log.warning(f"Could not send log to owner {OWNER_ID}: {e}")
 
+async def notify_chat(cid: int, text: str):
+    """Отчёт владельцу по конкретному чату — с учётом переключателя «Уведомления»."""
+    if get_chat_cfg(cid).get("notify_owner", True):
+        await notify_owner(text)
+
+async def notify_once(cid: int, key: str, text: str, every: float = 3600.0):
+    now = time.monotonic()
+    if now - notice_sent.get((cid, key), -1e9) < every:
+        return
+    notice_sent[(cid, key)] = now
+    await notify_chat(cid, text)
+
+def render_welcome(cfg: dict, user) -> str:
+    name = (user.first_name or "друг").strip() or "друг"
+    tpl = cfg.get("welcome_text") or "👋 Добро пожаловать, {name}!"
+    return tpl.replace("{name}", name)[:1000]  # replace, а не format: шаблон вводит человек
+
 
 # ==================== УТИЛИТЫ АДМИНИСТРИРОВАНИЯ ====================
 async def get_user_status(cid: int, uid: int) -> Tuple[bool, bool, str]:
@@ -161,32 +258,34 @@ async def get_user_status(cid: int, uid: int) -> Tuple[bool, bool, str]:
     cached = admin_cache.get((cid, uid))
     if cached and now - cached[2] < 20:
         return cached[0], cached[1], cached[3]
-    
+
     try:
         m = await bot.get_chat_member(cid, uid)
-        is_creator = m.status == ChatMemberStatus.CREATOR
-        is_admin = is_creator or m.status == ChatMemberStatus.ADMINISTRATOR
-        custom_title = getattr(m, "custom_title", "") or ""
     except Exception:
-        is_admin = False
-        is_creator = False
-        custom_title = ""
-        
+        return False, False, ""  # сбой API не кэшируем, иначе админа на 20 сек примем за обычного
+
+    is_creator = m.status == ChatMemberStatus.CREATOR
+    is_admin = is_creator or m.status == ChatMemberStatus.ADMINISTRATOR
+    custom_title = getattr(m, "custom_title", "") or ""
     admin_cache[(cid, uid)] = (is_admin, is_creator, now, custom_title)
     return is_admin, is_creator, custom_title
 
 def is_user_iris_rank4_or_admin(cid: int, uid: int, username: str = "", name: str = "", is_tg_admin: bool = False) -> bool:
     if is_tg_admin:
         return True
-    str_cid = str(cid)
-    ranks = db.get("iris_ranks", {}).get(str_cid, {})
-    for r in ["5", "4"]:
-        for user_item in ranks.get(r, []):
-            if user_item.get("id") and user_item["id"] == uid:
+    ranks = db.get("iris_ranks", {}).get(str(cid), {})
+    un_in = (username or "").lower().lstrip("@")
+    nm_in = (name or "").strip().lower()
+    for r in ("5", "4"):
+        for item in ranks.get(r, []):
+            if item.get("id") and item["id"] == uid:
                 return True
-            if username and user_item.get("username") and user_item["username"].lower() == username.lower().replace("@", ""):
-                return True
-            if name and user_item.get("name") and user_item["name"].lower() == name.lower():
+            item_un = (item.get("username") or "").lower()
+            if item_un:
+                if un_in and item_un == un_in:
+                    return True
+            # по имени сверяем только записи без юзернейма (имя легко подделать)
+            elif nm_in and (item.get("name") or "").strip().lower() == nm_in:
                 return True
     return False
 
@@ -349,28 +448,33 @@ async def mute_user_forever(cid: int, uid: int) -> bool:
         log.warning(f"mute forever failed for {uid} in {cid}: {e}")
         return False
 
+def _iris_like(uid: int, username: str, name: str, is_bot: bool) -> bool:
+    """Ирис — это БОТ. Обычного человека с «iris» в нике/имени за Ириса не считаем."""
+    if uid in KNOWN_IRIS_IDS:
+        return True
+    un = (username or "").lower().lstrip("@")
+    if un in KNOWN_IRIS_USERNAMES:
+        return True
+    if is_bot:
+        return "iris" in un or "ирис" in (name or "").lower()
+    return False
+
 async def scan_and_cache_iris(cid: int) -> List[int]:
     str_cid = str(cid)
-    if str_cid not in db["iris_ids"]:
-        db["iris_ids"][str_cid] = list(KNOWN_IRIS_IDS)
-    else:
-        for i_id in KNOWN_IRIS_IDS:
-            if i_id not in db["iris_ids"][str_cid]:
-                db["iris_ids"][str_cid].append(i_id)
-
+    ids = db["iris_ids"].setdefault(str_cid, [])
+    for i_id in KNOWN_IRIS_IDS:
+        if i_id not in ids:
+            ids.append(i_id)
     try:
         admins = await bot.get_chat_administrators(cid)
         for adm in admins:
             u = adm.user
-            un = (u.username or "").lower()
-            fn = (u.first_name or "").lower()
-            if u.id in KNOWN_IRIS_IDS or un in KNOWN_IRIS_USERNAMES or "iris" in un or "ирис" in fn:
-                if u.id not in db["iris_ids"][str_cid]:
-                    db["iris_ids"][str_cid].append(u.id)
+            if _iris_like(u.id, u.username or "", u.first_name or "", u.is_bot) and u.id not in ids:
+                ids.append(u.id)
         save_data()
     except Exception as e:
         log.warning(f"scan iris error in {cid}: {e}")
-    return db["iris_ids"][str_cid]
+    return ids
 
 async def revoke_all_iris(cid: int) -> bool:
     iris_list = await scan_and_cache_iris(cid)
@@ -382,23 +486,18 @@ async def revoke_all_iris(cid: int) -> bool:
             log.info(f"[{cid}] Сняты права у Ириса ID={iris_id}")
     return any_success
 
-def is_user_iris(cid: int, uid: int, username: str = "", name: str = "") -> bool:
-    str_cid = str(cid)
-    if uid in KNOWN_IRIS_IDS:
+def is_user_iris(cid: int, uid: int, username: str = "", name: str = "", is_bot: bool = False) -> bool:
+    if uid in db.get("iris_ids", {}).get(str(cid), []):
         return True
-    if uid in db.get("iris_ids", {}).get(str_cid, []):
-        return True
-    un = (username or "").lower()
-    fn = (name or "").lower()
-    if un in KNOWN_IRIS_USERNAMES or "iris" in un or "ирис" in fn:
-        return True
-    return False
+    return _iris_like(uid, username, name, is_bot)
 
 
 # ==================== АВТОПАРСИНГ СООБЩЕНИЙ ИРИСА (РАНГИ) ====================
 def parse_iris_staff_message(cid: int, text: str):
     str_cid = str(cid)
-    if "⭐" not in text and "админ" not in text.lower():
+    low = text.lower()
+    # это должен быть именно список стаффа, а не любое сообщение со звездой
+    if "⭐" not in text or not any(w in low for w in ("админ", "модер", "создател")):
         return False
 
     lines = text.split("\n")
@@ -459,6 +558,7 @@ def parse_iris_staff_message(cid: int, text: str):
 
 # ==================== 100% TIKTOK DOWNLOADER ====================
 TIKTOK_REGEX = re.compile(r"https?://(?:(?:www|vm|vt|m)\.)?tiktok\.com/[^\s]+")
+MAX_TT_BYTES = 49 * 1024 * 1024  # лимит Telegram для бота — 50 МБ
 
 async def download_tiktok(url: str) -> Optional[str]:
     headers = {
@@ -466,11 +566,14 @@ async def download_tiktok(url: str) -> Optional[str]:
         "Accept-Encoding": "gzip, deflate",
     }
     timeout = aiohttp.ClientTimeout(total=45)
+    filename: Optional[str] = None
+    ok = False
 
     try:
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             target_url = url
-            if "vt.tiktok.com" in url or "vm.tiktok.com" in url or "m.tiktok.com" in url:
+            host = (urlparse(url).hostname or "").lower()
+            if host in ("vt.tiktok.com", "vm.tiktok.com", "m.tiktok.com"):
                 try:
                     async with session.get(url, allow_redirects=True) as head_resp:
                         target_url = str(head_resp.url)
@@ -479,33 +582,52 @@ async def download_tiktok(url: str) -> Optional[str]:
 
             api_url = "https://www.tikwm.com/api/"
             async with session.post(api_url, data={"url": target_url, "hd": "1"}) as resp:
-                data = await resp.json()
+                data = await resp.json(content_type=None)
 
-            if data.get("code") != 0:
+            if not isinstance(data, dict) or data.get("code") != 0:
+                return None
+            info = data.get("data") or {}
+            video_url = info.get("hdplay") or info.get("play")
+            if not video_url or not str(video_url).startswith("https://"):
                 return None
 
-            video_url = data.get("data", {}).get("hdplay") or data.get("data", {}).get("play")
-            if not video_url:
-                return None
-
-            vid_id = data.get("data", {}).get("id", str(int(time.time())))
-            filename = f"tt_{vid_id}_{random.randint(100, 999)}.mp4"
+            vid_id = re.sub(r"\D", "", str(info.get("id", ""))) or str(int(time.time()))
+            filename = f"tt_{vid_id[:20]}_{random.randint(100, 999)}.mp4"
 
             async with session.get(video_url) as video_resp:
                 if video_resp.status != 200:
                     return None
+                if (video_resp.content_length or 0) > MAX_TT_BYTES:
+                    return None
+                total = 0
                 async with aiofiles.open(filename, "wb") as f:
                     async for chunk in video_resp.content.iter_chunked(16384):
+                        total += len(chunk)
+                        if total > MAX_TT_BYTES:
+                            return None
                         await f.write(chunk)
-
+            ok = True
             return filename
     except Exception as e:
         log.error(f"Error in download_tiktok: {e}")
         return None
+    finally:
+        if not ok and filename and os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
 
 async def handle_tiktok_message(m: Message, url: str):
     try:
-        video_file = await download_tiktok(url)
+        uid = m.from_user.id if m.from_user else 0
+        now = time.monotonic()
+        if now - tiktok_cooldown.get(uid, -1e9) < 10:
+            return  # не даём одному человеку забить бота ссылками
+        tiktok_cooldown[uid] = now
+
+        async with get_tiktok_sem():
+            video_file = await download_tiktok(url)
         if video_file and os.path.exists(video_file):
             try:
                 await m.reply_video(
@@ -523,66 +645,125 @@ async def handle_tiktok_message(m: Message, url: str):
 
 
 # ==================== ГЛОБАЛЬНЫЙ МИДДЛВАРЬ ЗАЩИТЫ ====================
+# Команда сноса — только в НАЧАЛЕ сообщения (так её и читает Ирис), а не «где-то в тексте»
+ANTI_IRIS_RE = re.compile(r"^\s*(?:ирис\s*[,:]?\s*)?[.!/]?\s*(?:кик|kick)\s+неактив", re.IGNORECASE)
+# Отдельное слово; «банан», «забавно», «.банально» — не считаются
+BAN_RE = re.compile(r"(?<!\w)(?:бан|ban)(?!\w)", re.IGNORECASE)
+KICK_RE = re.compile(r"(?<!\w)(?:кик|kick)(?!\w)", re.IGNORECASE)
+ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+
+
 class GlobalShieldMiddleware(BaseMiddleware):
     async def __call__(self, handler: Callable, event: TelegramObject, data: dict) -> Any:
         if isinstance(event, Message) and event.chat and event.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-            blocked = await self.process_group_message(event)
+            try:
+                blocked = await self.process_group_message(event)
+            except Exception:
+                # сбой защиты не должен класть весь бот: логируем и пропускаем сообщение дальше
+                log.exception("Ошибка в защите чата")
+                blocked = False
             if blocked:
                 return
         return await handler(event, data)
 
-    async def process_group_message(self, m: Message) -> bool:
-        if not m.from_user or m.from_user.id == BOT_ID:
-            return False
+    async def _punish_flood(self, m: Message, cid: int, uid: int, is_creator: bool, chat_title: str,
+                            user_name: str, username_str: str, kind: str, sample: str = ""):
+        is_text = kind == "text"
+        if is_creator:
+            try:
+                await m.reply("замучен на 10 минут\n@\n(ты создатель чата)" if is_text else "замучен на 10 минут\n(ты создатель)")
+            except Exception:
+                pass
+            return
 
+        muted = await mute_user_minutes(cid, uid, minutes=10)
+        if muted:  # не врём «замучен», если мут не прошёл
+            try:
+                await m.reply("замучен на 10 минут\n@" if is_text else "замучен на 10 минут")
+            except Exception:
+                pass
+
+        if is_text:
+            head = "🔇 <b>МУТ НА 10 МИНУТ ЗА СПАМ ТЕКСТОМ</b>" if muted else "⚠️ <b>СПАМ ТЕКСТОМ — замутить не вышло</b>"
+            reason = (f"<b>Текст спама:</b> <code>{esc(sample[:80])}</code>\n"
+                      f"<b>Повторено:</b> >10 раз за 10 секунд")
+        else:
+            head = "📸 <b>МУТ НА 10 МИНУТ ЗА СПАМ СТИКЕРОМ</b>" if muted else "⚠️ <b>СПАМ СТИКЕРОМ — замутить не вышло</b>"
+            reason = "<b>Причина:</b> один и тот же стикер отправлен >10 раз за 10 секунд"
+        tail = "" if muted else "\n<i>Нарушитель — админ или у бота нет права банить.</i>"
+        await notify_chat(
+            cid,
+            f"{head}\n"
+            f"<b>Чат:</b> «{esc(chat_title)}»\n"
+            f"<b>Нарушитель:</b> {esc(user_name)} ({esc(username_str)}) [ID: <code>{uid}</code>]\n"
+            f"{reason}{tail}"
+        )
+
+    async def process_group_message(self, m: Message) -> bool:
         cid = m.chat.id
         str_cid = str(cid)
-        uid = m.from_user.id
-        user_name = m.from_user.first_name or "Безымянный"
-        username_str = f"@{m.from_user.username}" if m.from_user.username else f"id:{uid}"
         chat_title = m.chat.title or f"Чат {cid}"
         cfg = get_chat_cfg(cid)
 
-        if str_cid not in db["chats"] or db["chats"][str_cid] != chat_title:
+        if db["chats"].get(str_cid) != chat_title:
             db["chats"][str_cid] = chat_title
 
-        # Статистика тайперов за день
-        today = get_today_str()
-        if str_cid not in db["stats_daily"]:
-            db["stats_daily"][str_cid] = {}
-        if today not in db["stats_daily"][str_cid]:
-            db["stats_daily"][str_cid][today] = {}
-        str_uid = str(uid)
-        db["stats_daily"][str_cid][today][str_uid] = db["stats_daily"][str_cid][today].get(str_uid, 0) + 1
+        # ---- служебные сообщения: приветствие новичков и уборка «вступил/вышел»
+        if m.new_chat_members or m.left_chat_member:
+            if cfg.get("welcome") and m.new_chat_members:
+                for u in m.new_chat_members:
+                    if u.is_bot:
+                        continue
+                    try:
+                        await bot.send_message(cid, render_welcome(cfg, u))
+                    except Exception as e:
+                        log.warning(f"welcome error in {cid}: {e}")
+            if cfg.get("clean_service"):
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+                return True
+            return False
 
-        is_tg_admin, is_creator, custom_title = await get_user_status(cid, uid)
+        if not m.from_user or m.from_user.id == BOT_ID:
+            return False
+
+        uid = m.from_user.id
+        user_name = m.from_user.first_name or "Безымянный"
+        username_str = f"@{m.from_user.username}" if m.from_user.username else f"id:{uid}"
+        is_iris = is_user_iris(cid, uid, m.from_user.username or "", user_name, m.from_user.is_bot)
+
+        # ---- автопарсинг списка админов Ириса (⭐⭐⭐⭐) — только от настоящего Ириса
+        if m.text and is_iris and "⭐" in m.text:
+            parse_iris_staff_message(cid, m.text)
+
+        # ---- боты и служебные аккаунты (анонимный админ, автопересылка канала) не трогаем
+        if m.from_user.is_bot or uid in (ANON_ADMIN_ID, CHANNEL_FWD_ID):
+            return False
+
+        # ---- статистика тайперов за день
+        today = get_today_str()
+        day_stats = db["stats_daily"].setdefault(str_cid, {}).setdefault(today, {})
+        str_uid = str(uid)
+        day_stats[str_uid] = day_stats.get(str_uid, 0) + 1
+
+        is_tg_admin, is_creator, _title = await get_user_status(cid, uid)
+        is_owner = uid == OWNER_ID
         now = time.monotonic()
 
         # -----------------------------------------------------------------------------
-        # ЖЕЛЕЗНЫЙ ИММУНИТЕТ ДЛЯ ВСЕХ МЕДИА (ГИФКИ, ФОТО, ВИДЕО, КРУЖОЧКИ, ГОЛОСОВЫЕ)
-        # Бот НИКОГДА НЕ МУТИТ за гифку/видео/фото, сколько бы их ни кидали!
+        # ИММУНИТЕТ ДЛЯ ВСЕХ МЕДИА (гифки, фото, видео, кружочки, голосовые)
         # -----------------------------------------------------------------------------
         if m.animation or m.video or m.video_note or m.photo or m.document or m.voice or m.audio:
             return False
 
         # -------------------------------------------------------------
-        # АВТОПАРСИНГ СПИСКА АДМИНОВ ИРИСА (когда Ирис присылает ⭐⭐⭐⭐)
+        # 1. МОМЕНТАЛЬНЫЙ АНТИ-ИРИС: «.кик неактив» / «!кик неактив» / «кик неактив»
+        # Создателя чата и владельца бота не трогаем.
         # -------------------------------------------------------------
-        if m.text and is_user_iris(cid, uid, m.from_user.username or "", m.from_user.first_name or ""):
-            if "⭐" in m.text:
-                parse_iris_staff_message(cid, m.text)
-
-        # -------------------------------------------------------------
-        # 1. МОМЕНТАЛЬНЫЙ АНТИ-ИРИС: .кик неактив / !кик неактив
-        # Мгновенно удаляет команду, чтобы Ирис не прочитал + снимает права у Ириса!
-        # -------------------------------------------------------------
-        if cfg["anti_iris"] and m.text:
-            text_clean = m.text.lower().strip()
-            if (
-                text_clean.startswith((".", "!", "/")) and "кик" in text_clean and "неактив" in text_clean
-            ) or (
-                "кик неактив" in text_clean
-            ):
+        if cfg.get("anti_iris", True) and m.text and not is_owner and not is_creator:
+            if ANTI_IRIS_RE.match(ZERO_WIDTH_RE.sub("", m.text)):
                 try:
                     await m.delete()
                 except Exception:
@@ -590,114 +771,69 @@ class GlobalShieldMiddleware(BaseMiddleware):
 
                 success = await revoke_all_iris(cid)
                 iris_alert[cid] = time.time()
-                log.info(f"[{cid}] ОБНАРУЖЕНА КОМАНДА СНОСА НЕАКТИВА -> Удалена, снятие Ириса: {success}")
-                
+                log.info(f"[{cid}] КОМАНДА СНОСА НЕАКТИВА -> удалена, права Ириса сняты: {success}")
+
                 try:
-                    await bot.send_message(cid, "🛡 <b>Команда сноса удалена! Права у Ириса отозваны.</b>", parse_mode="HTML")
+                    note = " Права у Ириса отозваны." if success else ""
+                    await bot.send_message(cid, f"🛡 <b>Команда сноса удалена!{note}</b>", parse_mode="HTML")
                 except Exception:
                     pass
 
-                await notify_owner(
+                await notify_chat(
+                    cid,
                     f"🛑 <b>СНОС НЕАКТИВА ПРЕДОТВРАЩЁН</b>\n"
-                    f"<b>Чат:</b> «{chat_title}»\n"
-                    f"<b>Кто отправил:</b> {user_name} ({username_str})\n"
-                    f"<b>Команда:</b> <code>{m.text}</code> (удалена)\n"
-                    f"<b>Снятие прав с Ириса:</b> {'Успешно' if success else 'Ирис назначен Создателем'}"
+                    f"<b>Чат:</b> «{esc(chat_title)}»\n"
+                    f"<b>Кто отправил:</b> {esc(user_name)} ({esc(username_str)}) [ID: <code>{uid}</code>]\n"
+                    f"<b>Команда:</b> <code>{esc(m.text[:200])}</code> (удалена)\n"
+                    f"<b>Снятие прав с Ириса:</b> {'Успешно' if success else 'не вышло (Ирис назначен Создателем)'}"
                 )
                 return True
 
         # -------------------------------------------------------------
-        # 2. АНТИФЛУД ТЕКСТОМ: ТОЛЬКО ПОЛНОСТЬЮ ОДИНАКОВОЕ СООБЩЕНИЕ (>10 за 10 сек)
-        # РАЗНЫЕ СООБЩЕНИЯ НЕ МУТЯТСЯ НИКОГДА!
-        # Мут на 10 минут + реплай:
-        # замучен на 10 минут
-        # @
+        # 2. АНТИФЛУД ТЕКСТОМ: только ПОЛНОСТЬЮ ОДИНАКОВОЕ сообщение (>10 за 10 сек)
         # -------------------------------------------------------------
-        if cfg.get("anti_flood_text", True) and m.text:
+        if cfg.get("anti_flood_text", True) and m.text and not is_owner:
             msg_exact = m.text.strip()
-            if len(msg_exact) > 0:
+            if msg_exact:
                 msg_hash = hashlib.sha256(msg_exact.encode("utf-8")).hexdigest()
-                
-                # Очищаем метки старше 10 секунд
                 cutoff_10 = now - 10.0
-                timestamps = flood_text_tracker[cid][uid][msg_hash]
-                valid_ts = [t for t in timestamps if t > cutoff_10]
+                valid_ts = [t for t in flood_text_tracker[cid][uid][msg_hash] if t > cutoff_10]
                 valid_ts.append(now)
                 flood_text_tracker[cid][uid][msg_hash] = valid_ts
 
-                # Срабатывает ТОЛЬКО если ИМЕННО ЭТОТ ТЕКСТ отправлен >10 раз за 10 сек!
                 if len(valid_ts) > 10:
                     flood_text_tracker[cid][uid].clear()
-                    if not is_creator:
-                        await mute_user_minutes(cid, uid, minutes=10)
-                        try:
-                            await m.reply("замучен на 10 минут\n@")
-                        except Exception:
-                            pass
-                        await notify_owner(
-                            f"🔇 <b>МУТ НА 10 МИНУТ ЗА СПАМ ТЕКСТОМ</b>\n"
-                            f"<b>Чат:</b> «{chat_title}»\n"
-                            f"<b>Нарушитель:</b> {user_name} ({username_str}) [ID: <code>{uid}</code>]\n"
-                            f"<b>Текст спама:</b> <code>{msg_exact[:80]}</code>\n"
-                            f"<b>Повторено:</b> >10 раз за 10 секунд"
-                        )
-                    else:
-                        try:
-                            await m.reply("замучен на 10 минут\n@\n(ты создатель чата)")
-                        except Exception:
-                            pass
+                    await self._punish_flood(m, cid, uid, is_creator, chat_title, user_name, username_str,
+                                             "text", msg_exact)
                     return True
 
         # -------------------------------------------------------------
-        # 3. АНТИСПАМ СТИКЕРАМИ: ТОЛЬКО ОДИН И ТОТ ЖЕ СТИКЕР (>10 за 10 сек)
-        # РАЗНЫЕ СТИКЕРЫ НЕ ТРОГАЕТ НИКОГДА!
-        # Мут на 10 минут + реплай: замучен на 10 минут
+        # 3. АНТИСПАМ СТИКЕРАМИ: только ОДИН И ТОТ ЖЕ стикер (>10 за 10 сек)
         # -------------------------------------------------------------
-        if cfg.get("anti_flood_sticker", True) and m.sticker:
+        if cfg.get("anti_flood_sticker", True) and m.sticker and not is_owner:
             stk_id = m.sticker.file_unique_id
             cutoff_10 = now - 10.0
-            stk_ts = flood_sticker_tracker[cid][uid][stk_id]
-            valid_stk = [t for t in stk_ts if t > cutoff_10]
+            valid_stk = [t for t in flood_sticker_tracker[cid][uid][stk_id] if t > cutoff_10]
             valid_stk.append(now)
             flood_sticker_tracker[cid][uid][stk_id] = valid_stk
 
-            # Срабатывает ТОЛЬКО если ОДИН И ТОТ ЖЕ СТИКЕР отправлен >10 раз за 10 сек!
             if len(valid_stk) > 10:
                 flood_sticker_tracker[cid][uid].clear()
-                if not is_creator:
-                    await mute_user_minutes(cid, uid, minutes=10)
-                    try:
-                        await m.reply("замучен на 10 минут")
-                    except Exception:
-                        pass
-                    await notify_owner(
-                        f"📸 <b>МУТ НА 10 МИНУТ ЗА СПАМ СТИКЕРОМ</b>\n"
-                        f"<b>Чат:</b> «{chat_title}»\n"
-                        f"<b>Нарушитель:</b> {user_name} ({username_str}) [ID: <code>{uid}</code>]\n"
-                        f"<b>Причина:</b> один и тот же стикер отправлен >10 раз за 10 секунд"
-                    )
-                else:
-                    try:
-                        await m.reply("замучен на 10 минут\n(ты создатель)")
-                    except Exception:
-                        pass
+                await self._punish_flood(m, cid, uid, is_creator, chat_title, user_name, username_str, "sticker")
                 return True
 
         # -------------------------------------------------------------
-        # 4. АНТИРЕЙД: БАН / КИК (5+ РАЗ ЗА 1 МИНУТУ)
-        # ТОЛЬКО ОТДЕЛЬНЫЕ СЛОВА "бан", "кик" (не подстроки в банан/забавно!)
-        # И ТОЛЬКО ОТ СТАРШИХ АДМИНОВ / 4 РАНГА ИРИСА!
+        # 4. АНТИРЕЙД: «бан» / «кик» 5+ раз за минуту (отдельные слова!)
+        # Следим за админами и за стаффом 4-5 ранга Ириса. Создатель и владелец бота — вне подозрений.
         # -------------------------------------------------------------
-        if cfg["anti_raid"] and m.text and not is_creator:
-            is_boss_or_rank4 = is_user_iris_rank4_or_admin(cid, uid, m.from_user.username or "", user_name, is_tg_admin)
-            if is_boss_or_rank4:
+        if cfg.get("anti_raid", True) and m.text and not is_creator and not is_owner:
+            if is_user_iris_rank4_or_admin(cid, uid, m.from_user.username or "", user_name, is_tg_admin):
                 text_low = m.text.lower()
-                ban_words = re.findall(r"(?:\b(?:бан|ban)\b|[.!\/](?:бан|ban))", text_low)
-                kick_words = re.findall(r"(?:\b(?:кик|kick)\b|[.!\/](?:кик|kick))", text_low)
+                ban_words = BAN_RE.findall(text_low)
+                kick_words = KICK_RE.findall(text_low)
 
                 triggered = False
                 action_word = ""
-
                 cutoff_60 = now - 60.0
 
                 if ban_words:
@@ -722,34 +858,33 @@ class GlobalShieldMiddleware(BaseMiddleware):
                     demote_ok = await demote_admin(cid, uid)
                     mute_ok = await mute_user_forever(cid, uid)
                     try:
-                        await m.reply("@glicu")
+                        await m.reply(RAID_REPLY)
                     except Exception:
                         pass
-                    await notify_owner(
-                        f"🚨 <b>ПРЕДОТВРАЩЁН РЕЙД АДМИНИСТРАТОРА (4 РАНГ)</b>\n"
-                        f"<b>Чат:</b> «{chat_title}»\n"
-                        f"<b>Нарушитель:</b> {user_name} ({username_str}) [ID: <code>{uid}</code>]\n"
-                        f"<b>Ранг:</b> Старший админ / 4 ранг\n"
+                    await notify_chat(
+                        cid,
+                        f"🚨 <b>ПРЕДОТВРАЩЁН РЕЙД АДМИНИСТРАТОРА</b>\n"
+                        f"<b>Чат:</b> «{esc(chat_title)}»\n"
+                        f"<b>Нарушитель:</b> {esc(user_name)} ({esc(username_str)}) [ID: <code>{uid}</code>]\n"
                         f"<b>Триггер:</b> 5+ раз слово '{action_word}' за 1 минуту\n"
-                        f"<b>Действие:</b> Сняты все права ({demote_ok}) + МУТ навсегда, ответ в чат: @glicu"
+                        f"<b>Права сняты:</b> {'да' if demote_ok else 'нет'} | <b>Мут навсегда:</b> {'да' if mute_ok else 'нет'}"
                     )
                     return True
 
         # -------------------------------------------------------------
-        # 5. СКАЧИВАНИЕ TIKTOK ВИДЕО БЕЗ ВОДЯНОГО ЗНАКА
+        # 5. СКАЧИВАНИЕ TIKTOK БЕЗ ВОДЯНОГО ЗНАКА
         # -------------------------------------------------------------
         if cfg.get("tiktok_dl", True) and m.text:
             tt_match = TIKTOK_REGEX.search(m.text)
             if tt_match:
-                tt_url = tt_match.group(0)
-                asyncio.create_task(handle_tiktok_message(m, tt_url))
+                spawn(handle_tiktok_message(m, tt_match.group(0)))
 
         # -------------------------------------------------------------
-        # 6. АНТИ-ССЫЛКИ
+        # 6. АНТИ-ССЫЛКИ (не трогаем админов и владельца)
         # -------------------------------------------------------------
-        if cfg.get("anti_links") and m.text and not is_tg_admin:
+        if cfg.get("anti_links") and m.text and not is_tg_admin and not is_owner:
             lo = m.text.lower()
-            if "t.me/" in lo or "telegram.me/" in lo:
+            if "t.me/" in lo or "telegram.me/" in lo or "telegram.dog/" in lo:
                 try:
                     await m.delete()
                 except Exception:
@@ -759,10 +894,9 @@ class GlobalShieldMiddleware(BaseMiddleware):
         # -------------------------------------------------------------
         # 7. ЗАПРЕЩЁННЫЕ СЛОВА
         # -------------------------------------------------------------
-        if cfg.get("anti_bad_words") and m.text and not is_tg_admin:
-            bad_list = db.get("bad_words", {}).get(str_cid, [])
+        if cfg.get("anti_bad_words") and m.text and not is_tg_admin and not is_owner:
             lo = m.text.lower()
-            for bw in bad_list:
+            for bw in db.get("bad_words", {}).get(str_cid, []):
                 if bw.lower() in lo:
                     try:
                         await m.delete()
@@ -771,17 +905,20 @@ class GlobalShieldMiddleware(BaseMiddleware):
                     return True
 
         # -------------------------------------------------------------
-        # 8. ПОЛЬЗОВАТЕЛЬСКИЕ ТРИГГЕРЫ (АВТООТВЕТЫ)
+        # 8. ПОЛЬЗОВАТЕЛЬСКИЕ ТРИГГЕРЫ (автоответы, не чаще раза в 3 сек на триггер)
         # -------------------------------------------------------------
         if cfg.get("triggers_enabled", True) and m.text:
             triggers = db.get("triggers", {}).get(str_cid, {})
             text_low = m.text.lower().strip()
             for trig_word, trig_reply in triggers.items():
                 if trig_word.lower() in text_low:
-                    try:
-                        await m.reply(trig_reply)
-                    except Exception:
-                        pass
+                    key = (cid, trig_word)
+                    if now - trigger_cooldown.get(key, -1e9) >= 3:
+                        trigger_cooldown[key] = now
+                        try:
+                            await m.reply(trig_reply)
+                        except Exception:
+                            pass
                     break
 
         return False
@@ -793,48 +930,131 @@ dp.message.outer_middleware(GlobalShieldMiddleware())
 @router.chat_member()
 async def on_chat_member_updated(event: ChatMemberUpdated):
     cid = event.chat.id
-    str_cid = str(cid)
     chat_title = event.chat.title or f"Чат {cid}"
     cfg = get_chat_cfg(cid)
 
-    if not cfg["anti_iris"]:
+    if not cfg.get("anti_iris", True):
         return
 
-    new_status = event.new_chat_member.status
-    if new_status not in (ChatMemberStatus.KICKED, ChatMemberStatus.RESTRICTED, ChatMemberStatus.LEFT):
+    target = event.new_chat_member
+    # Снос = кики/баны. Муты (RESTRICTED) сносом не считаем.
+    if target.status not in (ChatMemberStatus.KICKED, ChatMemberStatus.LEFT):
         return
 
     actor = event.from_user
-    if not actor or actor.id == BOT_ID:
+    # сам вышел / бот / владелец бота — не наш случай
+    if not actor or actor.id in (BOT_ID, OWNER_ID, target.user.id):
         return
 
-    iris_detected = is_user_iris(cid, actor.id, actor.username or "", actor.first_name or "")
-    now = time.time()
+    iris_detected = is_user_iris(cid, actor.id, actor.username or "", actor.first_name or "", actor.is_bot)
+    alert_active = (time.time() - iris_alert.get(cid, 0)) < 600
 
-    alert_time = iris_alert.get(cid, 0)
-    alert_active = (now - alert_time) < 600
+    mono = time.monotonic()
+    kicks = [t for t in admin_kicks[cid][actor.id] if t > mono - MASS_KICK_WINDOW]
+    kicks.append(mono)
+    admin_kicks[cid][actor.id] = kicks
+    mass_kick = len(kicks) >= MASS_KICK_LIMIT
 
-    admin_kicks[cid][actor.id].append(now)
-    cutoff_5 = now - 5.0
-    admin_kicks[cid][actor.id] = [t for t in admin_kicks[cid][actor.id] if t > cutoff_5]
-    mass_kick = len(admin_kicks[cid][actor.id]) >= 2
+    if not ((alert_active and iris_detected) or mass_kick):
+        return
+    # при сносе событий сотни — реагируем один раз, а не на каждый кик
+    if mono - recent_demote.get((cid, actor.id), -1e9) < 30:
+        return
 
-    if (alert_active and iris_detected) or mass_kick:
-        success = await demote_admin(cid, actor.id)
-        iris_alert.pop(cid, None)
+    _, actor_is_creator, _ = await get_user_status(cid, actor.id)
+    if actor_is_creator:
+        return
 
-        actor_mention = f"@{actor.username}" if actor.username else actor.first_name
-        if success:
-            try:
-                await bot.send_message(cid, f"🛡 снёс права у {actor_mention}. снос предотвращён.")
-            except Exception:
-                pass
-            await notify_owner(
-                f"🛑 <b>СНОС ЧАТА ПРЕДОТВРАЩЁН!</b>\n"
-                f"<b>Чат:</b> «{chat_title}»\n"
-                f"<b>Нарушитель:</b> {actor_mention} [ID: <code>{actor.id}</code>]\n"
-                f"<b>Действие:</b> Сняты все права администратора!"
+    recent_demote[(cid, actor.id)] = mono
+    admin_kicks[cid][actor.id] = []
+    iris_alert.pop(cid, None)
+    success = await demote_admin(cid, actor.id)
+
+    actor_mention = f"@{actor.username}" if actor.username else (actor.first_name or f"id{actor.id}")
+    if success:
+        try:
+            await bot.send_message(cid, f"🛡 снёс права у {actor_mention}. снос предотвращён.")
+        except Exception:
+            pass
+        await notify_chat(
+            cid,
+            f"🛑 <b>СНОС ЧАТА ПРЕДОТВРАЩЁН!</b>\n"
+            f"<b>Чат:</b> «{esc(chat_title)}»\n"
+            f"<b>Нарушитель:</b> {esc(actor_mention)} [ID: <code>{actor.id}</code>]\n"
+            f"<b>Действие:</b> Сняты все права администратора!"
+        )
+    else:
+        await notify_chat(
+            cid,
+            f"🚨 <b>ПОХОЖЕ НА СНОС, но права снять НЕ УДАЛОСЬ</b>\n"
+            f"<b>Чат:</b> «{esc(chat_title)}»\n"
+            f"<b>Кто:</b> {esc(actor_mention)} [ID: <code>{actor.id}</code>]\n"
+            f"Бот снимает права только с тех, кого назначил сам. Сними вручную!"
+        )
+
+
+# ==================== АВТОПРИНЯТИЕ ЗАЯВОК НА ВСТУПЛЕНИЕ ====================
+@router.chat_join_request()
+async def on_join_request(event: ChatJoinRequest):
+    cid = event.chat.id
+    cfg = get_chat_cfg(cid)
+    chat_title = event.chat.title or f"Чат {cid}"
+    if db["chats"].get(str(cid)) != chat_title:
+        db["chats"][str(cid)] = chat_title  # чат появится в списке настроек
+
+    if not cfg.get("auto_approve", True):
+        return  # автопринятие выключено — заявки решают админы вручную
+
+    now = time.monotonic()
+
+    # щит: наплыв заявок = рейд, ставим автопринятие на паузу
+    if cfg.get("join_shield", True):
+        recent = [t for t in join_tracker[cid] if t > now - JOIN_SHIELD_WINDOW]
+        recent.append(now)
+        join_tracker[cid] = recent
+        if len(recent) >= JOIN_SHIELD_LIMIT and join_pause_until.get(cid, 0) <= now:
+            join_pause_until[cid] = now + JOIN_SHIELD_PAUSE
+            log.warning(f"[{cid}] наплыв заявок — автопринятие на паузе")
+            await notify_chat(
+                cid,
+                f"🛑 <b>РЕЙД ЗАЯВОК</b>\n"
+                f"<b>Чат:</b> «{esc(chat_title)}»\n"
+                f"{len(recent)} заявок за {JOIN_SHIELD_WINDOW} сек. Автопринятие на паузе "
+                f"{JOIN_SHIELD_PAUSE // 60} мин, заявки висят — реши вручную.\n"
+                f"Снять паузу раньше: /start → чат → «Снять паузу»."
             )
+
+    if join_pause_until.get(cid, 0) > now:
+        return
+
+    try:
+        delay = max(0, min(int(cfg.get("approve_delay", 1)), 60))
+    except (TypeError, ValueError):
+        delay = 1
+    if delay:
+        await asyncio.sleep(delay)
+
+    # пока ждали, могли выключить автопринятие или включиться пауза
+    if not get_chat_cfg(cid).get("auto_approve", True) or join_pause_until.get(cid, 0) > time.monotonic():
+        return
+
+    try:
+        await bot.approve_chat_join_request(chat_id=cid, user_id=event.from_user.id)
+        log.info(f"[{cid}] заявка принята: {event.from_user.id}")
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if "already_participant" in msg or "hide_requester_missing" in msg:
+            log.info(f"[{cid}] заявка {event.from_user.id} уже обработана")
+        else:
+            log.warning(f"[{cid}] не удалось принять заявку {event.from_user.id}: {e}")
+            await notify_once(
+                cid, "approve_fail",
+                f"⚠️ <b>Не могу принять заявку</b> в «{esc(chat_title)}»\n"
+                f"<code>{esc(getattr(e, 'message', str(e)))}</code>\n"
+                f"Проверь: бот — админ с правом «Приглашение пользователей»."
+            )
+    except Exception:
+        log.exception(f"[{cid}] ошибка автопринятия заявки {event.from_user.id}")
 
 
 # ==================== КОМАНДА /admins — ВЫВОД ВСЕХ АДМИНОВ И РАНГОВ ====================
@@ -873,8 +1093,8 @@ async def cmd_admins_list(m: Message):
             found_any = True
             lines.append(f"<b>{rank_titles[r]}:</b>")
             for u in users_in_rank:
-                un_str = f" (@{u['username']})" if u.get("username") else ""
-                lines.append(f"• <b>{u['name']}</b>{un_str}")
+                un_str = f" (@{esc(u['username'])})" if u.get("username") else ""
+                lines.append(f"• <b>{esc(u['name'])}</b>{un_str}")
             lines.append("")
 
     if not found_any:
@@ -882,9 +1102,9 @@ async def cmd_admins_list(m: Message):
         lines.append("<b>Администраторы Telegram:</b>")
         for u_id, adm in tg_admins_dict.items():
             u = adm.user
-            nm = u.first_name or f"id{u.id}"
-            un = f" (@{u.username})" if u.username else ""
-            status_text = "Создатель" if adm.status == ChatMemberStatus.CREATOR else (getattr(adm, "custom_title", "") or "Администратор")
+            nm = esc(u.first_name or f"id{u.id}")
+            un = f" (@{esc(u.username)})" if u.username else ""
+            status_text = esc("Создатель" if adm.status == ChatMemberStatus.CREATOR else (getattr(adm, "custom_title", "") or "Администратор"))
             bot_tag = " [ИРИС]" if u.id in KNOWN_IRIS_IDS or (u.username and "iris" in u.username.lower()) else ""
             lines.append(f"• <b>{nm}</b>{un} — <code>{status_text}</code>{bot_tag}")
 
@@ -902,11 +1122,14 @@ async def cmd_set_rank_manual(m: Message):
 
     parts = m.text.split()
     if len(parts) < 3:
-        await m.reply("Использование: <code>/setrank @username 4</code> (где 4 — Старший админ)")
+        await m.reply("Использование: <code>/setrank @username 4</code> (где 4 — Старший админ)", parse_mode="HTML")
         return
 
     target = parts[1].replace("@", "").strip()
     rank_num = parts[2].strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", target):
+        await m.reply("Некорректный юзернейм (латиница, цифры, _; 3–32 символа).")
+        return
     if rank_num not in ["1", "2", "3", "4", "5"]:
         await m.reply("Ранг должен быть от 1 до 5!")
         return
@@ -988,22 +1211,23 @@ async def cmd_adda_handler(m: Message):
         current_perms = await get_admin_perms_dict(cid, target_user.id)
 
         now_time = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M:%S")
-        msg_text = f"🗓 <b>ТГ-права администратора {target_name}</b> {now_time}"
+        msg_text = f"🗓 <b>ТГ-права администратора {esc(target_name)}</b> {now_time}"
         await m.reply(msg_text, reply_markup=kb_admin_panel(cid, target_user.id, current_perms), parse_mode="HTML")
 
         await notify_owner(
             f"👑 <b>ОТКРЫТА ПАНЕЛЬ ПРАВ /adda</b>\n"
-            f"<b>Чат:</b> «{m.chat.title}»\n"
-            f"<b>Кому:</b> {target_name} [ID: <code>{target_user.id}</code>]\n"
+            f"<b>Чат:</b> «{esc(m.chat.title or "")}»\n"
+            f"<b>Кому:</b> {esc(target_name)} [ID: <code>{target_user.id}</code>]\n"
             f"<b>Префикс:</b> <code>[{clean_prefix}]</code>"
         )
     except TelegramBadRequest as e:
         log.error(f"TelegramBadRequest in /adda: {e.message}")
         await m.reply(
-            f"⚠️ Ошибка Telegram API: <code>{e.message}</code>\n\n"
+            f"⚠️ Ошибка Telegram API: <code>{esc(e.message)}</code>\n\n"
             f"<b>Подсказка:</b>\n"
             f"1. Убедись, что наш бот стоит выше этого пользователя в списке администраторов.\n"
-            f"2. Если ты пытаешься выдать права Ирису, а он уже назначен Создателем — сначала сними Ириса с админки в Telegram, а затем назначь через бота!"
+            f"2. Если ты пытаешься выдать права Ирису, а он уже назначен Создателем — сначала сними Ириса с админки в Telegram, а затем назначь через бота!",
+            parse_mode="HTML"
         )
     except Exception as e:
         log.error(f"Error in /adda: {e}")
@@ -1022,9 +1246,16 @@ async def cb_toggle_admin_perm(cb: CallbackQuery):
         await cb.answer()
         return
 
-    cid = int(parts[1])
-    uid = int(parts[2])
+    try:
+        cid = int(parts[1])
+        uid = int(parts[2])
+    except ValueError:
+        await cb.answer()
+        return
     perm_key = parts[3]
+    if perm_key not in PERM_NAMES_RU:
+        await cb.answer()
+        return
 
     bot_rights = await get_bot_admin_rights(cid)
     current_p = await get_admin_perms_dict(cid, uid)
@@ -1094,8 +1325,12 @@ async def cb_admin_revoke(cb: CallbackQuery):
         await cb.answer()
         return
 
-    cid = int(parts[1])
-    uid = int(parts[2])
+    try:
+        cid = int(parts[1])
+        uid = int(parts[2])
+    except ValueError:
+        await cb.answer()
+        return
 
     ok = await demote_admin(cid, uid)
     if ok:
@@ -1135,8 +1370,8 @@ async def cmd_revoke_handler(m: Message):
         await m.reply(f"забрал префикс и все права у {target_name}")
         await notify_owner(
             f"🗑 <b>СНЯТЫ ВСЕ ПРАВА (/rev)</b>\n"
-            f"<b>Чат:</b> «{m.chat.title}»\n"
-            f"<b>У кого:</b> {target_name} [ID: <code>{target_user.id}</code>]"
+            f"<b>Чат:</b> «{esc(m.chat.title or "")}»\n"
+            f"<b>У кого:</b> {esc(target_name)} [ID: <code>{target_user.id}</code>]"
         )
     else:
         await m.reply(
@@ -1206,13 +1441,13 @@ async def handle_cmd_add_simple(m: Message):
 
         await notify_owner(
             f"👑 <b>ВЫДАН ПРЕФИКС БЕЗ ПРАВ</b>\n"
-            f"<b>Чат:</b> «{m.chat.title}»\n"
-            f"<b>Кому:</b> {target_name} [ID: <code>{target_user.id}</code>]\n"
+            f"<b>Чат:</b> «{esc(m.chat.title or "")}»\n"
+            f"<b>Кому:</b> {esc(target_name)} [ID: <code>{target_user.id}</code>]\n"
             f"<b>Префикс:</b> <code>[{clean_prefix}]</code>"
         )
     except TelegramBadRequest as e:
         log.error(f"TelegramBadRequest in /add: {e.message}")
-        await m.reply(f"⚠️ Ошибка Telegram API: <code>{e.message}</code>\n(Убедись, что наш бот стоит выше этого юзера в списке админов)")
+        await m.reply(f"⚠️ Ошибка Telegram API: <code>{esc(e.message)}</code>\n(Убедись, что наш бот стоит выше этого юзера в списке админов)", parse_mode="HTML")
     except Exception as e:
         log.error(f"Error in /add: {e}")
         await m.reply(f"⚠️ Ошибка: {e}")
@@ -1225,10 +1460,14 @@ async def on_my_chat_member_updated(event: ChatMemberUpdated):
     if event.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         cid = event.chat.id
         str_cid = str(cid)
-        if event.new_chat_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
+        status = event.new_chat_member.status
+        if status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER):
             db["chats"][str_cid] = event.chat.title or f"Chat {cid}"
             save_data()
-            asyncio.create_task(scan_and_cache_iris(cid))
+            spawn(scan_and_cache_iris(cid))
+        elif status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+            db["chats"].pop(str_cid, None)  # убрали из списка (настройки остаются в базе)
+            save_data()
 
 
 # ==================== НАСТРОЙКИ В ЛС ====================
@@ -1251,7 +1490,13 @@ def kb_chat_panel(chat_id: int) -> InlineKeyboardMarkup:
     trig_count = len(db.get("triggers", {}).get(str_cid, {}))
     bad_count = len(db.get("bad_words", {}).get(str_cid, []))
 
-    return InlineKeyboardMarkup(inline_keyboard=[
+    try:
+        delay = int(cfg.get("approve_delay", 1))
+    except (TypeError, ValueError):
+        delay = 1
+    delay_label = "сразу" if delay == 0 else f"{delay} сек"
+
+    rows = [
         [
             InlineKeyboardButton(text=f"🛡 Рейд админов (5х): {icon(cfg['anti_raid'])}", callback_data=f"tog:{str_cid}:anti_raid"),
             InlineKeyboardButton(text=f"🛑 Анти-Ирис: {icon(cfg['anti_iris'])}", callback_data=f"tog:{str_cid}:anti_iris"),
@@ -1269,6 +1514,25 @@ def kb_chat_panel(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"🤬 Запретка: {icon(cfg.get('anti_bad_words', False))}", callback_data=f"tog:{str_cid}:anti_bad_words"),
         ],
         [
+            InlineKeyboardButton(text=f"🚪 Автопринятие заявок: {icon(cfg.get('auto_approve', True))}", callback_data=f"tog:{str_cid}:auto_approve"),
+            InlineKeyboardButton(text=f"⏱ Задержка: {delay_label}", callback_data=f"cyc:{str_cid}:approve_delay"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🛑 Щит от рейда заявок: {icon(cfg.get('join_shield', True))}", callback_data=f"tog:{str_cid}:join_shield"),
+            InlineKeyboardButton(text=f"🔔 Отчёты мне: {icon(cfg.get('notify_owner', True))}", callback_data=f"tog:{str_cid}:notify_owner"),
+        ],
+        [
+            InlineKeyboardButton(text=f"👋 Приветствие: {icon(cfg.get('welcome', False))}", callback_data=f"tog:{str_cid}:welcome"),
+            InlineKeyboardButton(text="✏️ Текст приветствия", callback_data=f"welcome_edit:{str_cid}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🧹 Убирать «зашёл/вышел»: {icon(cfg.get('clean_service', False))}", callback_data=f"tog:{str_cid}:clean_service"),
+        ],
+    ]
+    if join_pause_until.get(chat_id, 0) > time.monotonic():
+        rows.append([InlineKeyboardButton(text="▶️ Снять паузу автопринятия (был рейд заявок)", callback_data=f"join_resume:{str_cid}")])
+    rows += [
+        [
             InlineKeyboardButton(text=f"🎯 Триггеры ({trig_count} шт.): {icon(cfg.get('triggers_enabled', True))}", callback_data=f"menu_trig:{str_cid}"),
             InlineKeyboardButton(text=f"🚫 Запретные слова ({bad_count} шт.)", callback_data=f"menu_bad:{str_cid}"),
         ],
@@ -1278,8 +1542,39 @@ def kb_chat_panel(chat_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📖 Справка", callback_data="help_manual"),
             InlineKeyboardButton(text="⬅️ К чатам", callback_data="back_to_chats"),
-        ]
-    ])
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------- общие помощники для панели ----------
+async def owner_only(cb: CallbackQuery) -> bool:
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("не овнер", show_alert=True)
+        return False
+    return True
+
+def parse_cid(data: str, idx: int = 1) -> Optional[int]:
+    try:
+        return int(data.split(":")[idx])
+    except (IndexError, ValueError):
+        return None
+
+async def safe_edit(cb: CallbackQuery, text: Optional[str] = None, markup: Optional[InlineKeyboardMarkup] = None,
+                    parse_mode: Optional[str] = None):
+    """Редактирование сообщения без падений: «message is not modified» и недоступные сообщения игнорируем."""
+    msg = cb.message
+    if not isinstance(msg, Message):
+        return
+    try:
+        if text is None:
+            await msg.edit_reply_markup(reply_markup=markup)
+        else:
+            await msg.edit_text(text, reply_markup=markup, parse_mode=parse_mode)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            log.warning(f"edit error: {e}")
+
 
 @router.message(CommandStart())
 async def cmd_start_private(m: Message):
@@ -1287,7 +1582,7 @@ async def cmd_start_private(m: Message):
         await m.reply(f"настройки только в лс: @{BOT_USERNAME}")
         return
 
-    if m.from_user.id != OWNER_ID:
+    if not m.from_user or m.from_user.id != OWNER_ID:
         await m.reply("доступ запрещён. ты не овнер бота.")
         return
 
@@ -1300,101 +1595,193 @@ async def cmd_start_private(m: Message):
 
 @router.callback_query(F.data == "back_to_chats")
 async def cb_back_to_chats(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
-    await cb.message.edit_text("выбирай чат для настройки:", reply_markup=kb_chat_list())
+    await safe_edit(cb, "выбирай чат для настройки:", kb_chat_list())
     await cb.answer()
 
 @router.callback_query(F.data == "refresh_chats")
 async def cb_refresh_chats(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
-    await cb.message.edit_text("выбирай чат для настройки:", reply_markup=kb_chat_list())
+    await safe_edit(cb, "выбирай чат для настройки:", kb_chat_list())
     await cb.answer("обновлено")
 
 @router.callback_query(F.data == "help_manual")
 async def cb_help_manual(cb: CallbackQuery):
+    if not await owner_only(cb):
+        return
     manual = (
         "📖 <b>ПОЛНОЕ ОПИСАНИЕ ЗАЩИТЫ БОТА:</b>\n\n"
         "🔄 <b>1. Антифлуд одинаковым текстом:</b>\n"
         "— Мутит ТОЛЬКО если человек отправил ОДНО И ТО ЖЕ сообщение >10 раз за 10 сек!\n"
         "— Наказание: мут на 10 минут, реплай: <code>замучен на 10 минут\n@</code>.\n"
-        "— <b>Разные сообщения не трогает вообще (хоть 100 сообщений в секунду)!</b>\n\n"
+        "— <b>Разные сообщения не трогает вообще.</b>\n\n"
         "📸 <b>2. Антифлуд одинаковыми стикерами:</b>\n"
-        "— Мутит ТОЛЬКО если спамят ОДИН И ТОТ ЖЕ стикер >10 раз за 10 сек.\n"
-        "— Наказание: мут на 10 минут, реплай: <code>замучен на 10 минут</code>.\n\n"
-        "🛡 <b>3. Полный иммунитет для гифок, фото и видео:</b>\n"
-        "— Бот НИКОГДА не мутит за гифки, фото, видео и кружочки. Никаких ложных срабатываний!\n\n"
+        "— Мутит ТОЛЬКО если спамят ОДИН И ТОТ ЖЕ стикер >10 раз за 10 сек.\n\n"
+        "🛡 <b>3. Иммунитет для гифок, фото и видео:</b>\n"
+        "— Бот НИКОГДА не мутит за гифки, фото, видео и кружочки.\n\n"
         "🛡 <b>4. Антирейд админов (бан/кик 5х):</b>\n"
-        "— Проверяет ТОЛЬКО самостоятельные слова 'бан' или 'кик' (не путает со словами 'банан/забавно').\n"
-        "— Отслеживает Старших админов (4 ранг Ириса). При 5+ словах за 1 мин: снятие всех прав + мут + реплай <code>@glicu</code>.\n\n"
+        "— Считает только самостоятельные слова 'бан' / 'кик'. При 5+ за минуту у админа или стаффа 4-5 ранга: "
+        "снятие прав + мут навсегда + реплай.\n\n"
         "🛑 <b>5. Анти-Ирис (кик неактив):</b>\n"
-        "— Мгновенно удаляет команду <code>.кик неактив</code> из чата и лишает Ириса прав!\n\n"
+        "— Удаляет команду <code>.кик неактив</code> и снимает права у Ириса. Создателя чата и тебя не трогает.\n\n"
         "👑 <b>6. Ранги Ириса (/admins):</b>\n"
-        "— Команда <code>/admins</code> показывает актуальную сетку админов и рангов.\n"
-        "— Ранги обновляются автоматически, когда Ирис отвечает на команду 'админы'.\n\n"
+        "— Ранги обновляются, когда Ирис присылает список стаффа.\n\n"
         "🎬 <b>7. Скачивание TikTok:</b>\n"
-        "— Отправляешь ссылку TikTok (vt.tiktok.com / vm.tiktok.com) — бот скачивает видео БЕЗ водяного знака и шлет видео файлом в чат!"
+        "— Ссылка TikTok в чате → видео без водяного знака (не чаще раза в 10 сек от человека, до 50 МБ).\n\n"
+        "🚪 <b>8. Автопринятие заявок:</b>\n"
+        "— Бот принимает заявки на вступление через заданную задержку (по умолчанию 1 сек, кнопка «Задержка» листает 0/1/3/5/10/30). "
+        "Нужны права админа «Приглашение пользователей». Выключи — заявки решают админы.\n\n"
+        "🛑 <b>9. Щит от рейда заявок:</b>\n"
+        "— Если за 30 сек пришло 15+ заявок, автопринятие встаёт на паузу на 10 мин, заявки не принимаются. "
+        "Паузу можно снять кнопкой.\n\n"
+        "👋 <b>10. Приветствие</b> (текст меняется, <code>{name}</code> — имя новичка) и "
+        "🧹 <b>уборка «зашёл/вышел»</b> — каждое отдельно включается и выключается.\n\n"
+        "🔔 <b>11. Отчёты мне:</b> выключает уведомления в личку по этому чату."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_chats")]
     ])
-    await cb.message.edit_text(manual, reply_markup=kb, parse_mode="HTML")
+    await safe_edit(cb, manual, kb, parse_mode="HTML")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("cfg_chat:"))
 async def cb_open_chat_cfg(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
-    str_cid = cb.data.split(":")[1]
-    cid = int(str_cid)
-    title = db.get("chats", {}).get(str_cid, f"Чат {cid}")
+    cid = parse_cid(cb.data)
+    if cid is None:
+        await cb.answer()
+        return
+    title = db.get("chats", {}).get(str(cid), f"Чат {cid}")
     await scan_and_cache_iris(cid)
-    await cb.message.edit_text(
-        f"⚙️ настройки для «{title}»:\nжми на кнопки для переключения:",
-        reply_markup=kb_chat_panel(cid)
-    )
+    await safe_edit(cb, f"⚙️ настройки для «{title}»:\nжми на кнопки для переключения:", kb_chat_panel(cid))
     await cb.answer()
 
 @router.callback_query(F.data.startswith("tog:"))
 async def cb_toggle_option(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
-    _, str_cid, opt = cb.data.split(":")
-    cid = int(str_cid)
+    parts = cb.data.split(":")
+    cid = parse_cid(cb.data)
+    opt = parts[2] if len(parts) > 2 else ""
+    if cid is None or opt not in TOGGLE_KEYS:  # произвольные ключи в настройки не пускаем
+        await cb.answer("неизвестная опция")
+        return
     cfg = get_chat_cfg(cid)
-    cfg[opt] = not cfg.get(opt, True)
+    cfg[opt] = not cfg.get(opt, default_settings().get(opt, True))
     save_data()
-    await cb.message.edit_reply_markup(reply_markup=kb_chat_panel(cid))
+    await safe_edit(cb, markup=kb_chat_panel(cid))
     await cb.answer("включено" if cfg[opt] else "выключено")
+
+@router.callback_query(F.data.startswith("cyc:"))
+async def cb_cycle_option(cb: CallbackQuery):
+    if not await owner_only(cb):
+        return
+    parts = cb.data.split(":")
+    cid = parse_cid(cb.data)
+    if cid is None or len(parts) < 3 or parts[2] != "approve_delay":
+        await cb.answer()
+        return
+    cfg = get_chat_cfg(cid)
+    try:
+        cur = int(cfg.get("approve_delay", 1))
+    except (TypeError, ValueError):
+        cur = 1
+    nxt = JOIN_DELAYS[(JOIN_DELAYS.index(cur) + 1) % len(JOIN_DELAYS)] if cur in JOIN_DELAYS else 1
+    cfg["approve_delay"] = nxt
+    save_data()
+    await safe_edit(cb, markup=kb_chat_panel(cid))
+    await cb.answer("принимаю сразу" if nxt == 0 else f"задержка {nxt} сек")
+
+@router.callback_query(F.data.startswith("join_resume:"))
+async def cb_join_resume(cb: CallbackQuery):
+    if not await owner_only(cb):
+        return
+    cid = parse_cid(cb.data)
+    if cid is None:
+        await cb.answer()
+        return
+    join_pause_until.pop(cid, None)
+    join_tracker.pop(cid, None)
+    await safe_edit(cb, markup=kb_chat_panel(cid))
+    await cb.answer("Пауза снята. Заявки, что висели, прими вручную.", show_alert=True)
+
+@router.callback_query(F.data.startswith("welcome_edit:"))
+async def cb_welcome_edit(cb: CallbackQuery, state: FSMContext):
+    if not await owner_only(cb):
+        return
+    cid = parse_cid(cb.data)
+    if cid is None:
+        await cb.answer()
+        return
+    await state.set_state(FormStates.waiting_for_welcome_text)
+    await state.update_data(target_cid=str(cid))
+    cur = get_chat_cfg(cid).get("welcome_text", "")
+    await safe_edit(
+        cb,
+        f"✏️ Пришли новый текст приветствия (до 500 символов).\n"
+        f"<code>{{name}}</code> заменится на имя новичка.\n\nСейчас:\n<i>{esc(cur)}</i>",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data=f"cfg_chat:{cid}")]
+        ]),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+@router.message(FormStates.waiting_for_welcome_text)
+async def process_welcome_text(m: Message, state: FSMContext):
+    if not m.from_user or m.from_user.id != OWNER_ID or not m.text:
+        return
+    text = m.text.strip()
+    if not text or len(text) > 500:
+        await m.reply("Текст должен быть от 1 до 500 символов. Пришли ещё раз.")
+        return
+    data = await state.get_data()
+    try:
+        cid = int(data.get("target_cid"))
+    except (TypeError, ValueError):
+        await state.clear()
+        return
+    get_chat_cfg(cid)["welcome_text"] = text
+    save_data()
+    await state.clear()
+    await m.reply(
+        "✅ Текст приветствия сохранён. Не забудь включить «Приветствие».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К настройкам чата", callback_data=f"cfg_chat:{cid}")]
+        ]),
+    )
 
 @router.callback_query(F.data.startswith("scan_iris:"))
 async def cb_scan_iris(cb: CallbackQuery):
-    str_cid = cb.data.split(":")[1]
-    cid = int(str_cid)
+    if not await owner_only(cb):
+        return
+    cid = parse_cid(cb.data)
+    if cid is None:
+        await cb.answer()
+        return
     iris_ids = await scan_and_cache_iris(cid)
-    await cb.message.edit_reply_markup(reply_markup=kb_chat_panel(cid))
+    await safe_edit(cb, markup=kb_chat_panel(cid))
     await cb.answer(f"Ирисов в базе чата: {len(iris_ids)} шт.", show_alert=True)
 
 
 # ==================== МЕНЮ ТРИГГЕРОВ ====================
+# В callback_data кладём ИНДЕКС, а не слово: лимит Telegram 64 байта, кириллица занимает по 2,
+# а двоеточие в слове ломало разбор. Раньше длинное слово вешало всё меню.
 def kb_triggers_menu(str_cid: str) -> InlineKeyboardMarkup:
-    trigs = db.get("triggers", {}).get(str_cid, {})
+    trigs = list(db.get("triggers", {}).get(str_cid, {}).keys())
     buttons = []
-    for word in list(trigs.keys())[:8]:
-        buttons.append([InlineKeyboardButton(text=f"❌ Удалить '{word}'", callback_data=f"del_trig:{str_cid}:{word}")])
+    for i, word in enumerate(trigs[:8]):
+        buttons.append([InlineKeyboardButton(text=f"❌ Удалить '{word[:30]}'", callback_data=f"del_trig:{str_cid}:{i}")])
     buttons.append([InlineKeyboardButton(text="➕ Добавить триггер", callback_data=f"add_trig:{str_cid}")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data=f"cfg_chat:{str_cid}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @router.callback_query(F.data.startswith("menu_trig:"))
 async def cb_menu_triggers(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     str_cid = cb.data.split(":")[1]
     trigs = db.get("triggers", {}).get(str_cid, {})
@@ -1403,71 +1790,86 @@ async def cb_menu_triggers(cb: CallbackQuery):
         text += "Пока нет добавленных триггеров.\nНажми 'Добавить', чтобы бот отвечал на нужные слова!"
     else:
         for w, r in trigs.items():
-            text += f"• <code>{w}</code> ➡️ <i>{r}</i>\n"
+            text += f"• <code>{esc(w)}</code> ➡️ <i>{esc(r[:100])}</i>\n"
+            if len(text) > 3500:
+                text += "…"
+                break
 
-    await cb.message.edit_text(text, reply_markup=kb_triggers_menu(str_cid), parse_mode="HTML")
+    await safe_edit(cb, text, kb_triggers_menu(str_cid), parse_mode="HTML")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("add_trig:"))
 async def cb_add_trigger_start(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     str_cid = cb.data.split(":")[1]
     await state.set_state(FormStates.waiting_for_trigger_word)
     await state.update_data(target_cid=str_cid)
-    await cb.message.edit_text(
+    await safe_edit(
+        cb,
         "✏️ Шаг 1: Напиши <b>слово или фразу</b>, на которую бот должен реагировать в чате:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отмена", callback_data=f"menu_trig:{str_cid}")]
         ]),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     await cb.answer()
 
 @router.message(FormStates.waiting_for_trigger_word)
 async def process_trigger_word(m: Message, state: FSMContext):
-    if m.from_user.id != OWNER_ID or not m.text:
+    if not m.from_user or m.from_user.id != OWNER_ID or not m.text:
         return
     word = m.text.strip().lower()
+    if not word or len(word) > 64:
+        await m.reply("Слово должно быть от 1 до 64 символов. Пришли ещё раз.")
+        return
     await state.update_data(trigger_word=word)
     await state.set_state(FormStates.waiting_for_trigger_reply)
     await m.reply(
-        f"✅ Слово: <code>{word}</code>\n\n✏️ Шаг 2: Теперь напиши <b>текст ответа</b>, который бот напишет в чат:",
+        f"✅ Слово: <code>{esc(word)}</code>\n\n✏️ Шаг 2: Теперь напиши <b>текст ответа</b>, который бот напишет в чат:",
         parse_mode="HTML"
     )
 
 @router.message(FormStates.waiting_for_trigger_reply)
 async def process_trigger_reply(m: Message, state: FSMContext):
-    if m.from_user.id != OWNER_ID or not m.text:
+    if not m.from_user or m.from_user.id != OWNER_ID or not m.text:
         return
     data = await state.get_data()
     str_cid = data.get("target_cid")
     word = data.get("trigger_word")
     reply_text = m.text.strip()
+    if not str_cid or not word:
+        await state.clear()
+        return
+    if not reply_text or len(reply_text) > 1000:
+        await m.reply("Ответ должен быть от 1 до 1000 символов. Пришли ещё раз.")
+        return
 
-    if str_cid not in db["triggers"]:
-        db["triggers"][str_cid] = {}
-    db["triggers"][str_cid][word] = reply_text
+    db["triggers"].setdefault(str_cid, {})[word] = reply_text
     save_data()
     await state.clear()
 
     await m.reply(
-        f"🎉 <b>Триггер сохранён!</b>\nСлово: <code>{word}</code> ➡️ <i>{reply_text}</i>",
+        f"🎉 <b>Триггер сохранён!</b>\nСлово: <code>{esc(word)}</code> ➡️ <i>{esc(reply_text[:200])}</i>",
         reply_markup=kb_triggers_menu(str_cid),
         parse_mode="HTML"
     )
 
 @router.callback_query(F.data.startswith("del_trig:"))
 async def cb_delete_trigger(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     parts = cb.data.split(":")
     str_cid = parts[1]
-    word = parts[2]
-    if str_cid in db["triggers"] and word in db["triggers"][str_cid]:
-        del db["triggers"][str_cid][word]
+    try:
+        idx = int(parts[2])
+    except (IndexError, ValueError):
+        await cb.answer()
+        return
+    trigs = db.get("triggers", {}).get(str_cid, {})
+    keys = list(trigs.keys())
+    if 0 <= idx < len(keys):
+        del trigs[keys[idx]]
         save_data()
     await cb_menu_triggers(cb)
 
@@ -1476,16 +1878,15 @@ async def cb_delete_trigger(cb: CallbackQuery):
 def kb_bad_menu(str_cid: str) -> InlineKeyboardMarkup:
     words = db.get("bad_words", {}).get(str_cid, [])
     buttons = []
-    for w in words[:8]:
-        buttons.append([InlineKeyboardButton(text=f"❌ Удалить '{w}'", callback_data=f"del_bad:{str_cid}:{w}")])
+    for i, w in enumerate(words[:8]):
+        buttons.append([InlineKeyboardButton(text=f"❌ Удалить '{w[:30]}'", callback_data=f"del_bad:{str_cid}:{i}")])
     buttons.append([InlineKeyboardButton(text="➕ Добавить запретное слово", callback_data=f"add_bad:{str_cid}")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад в настройки", callback_data=f"cfg_chat:{str_cid}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @router.callback_query(F.data.startswith("menu_bad:"))
 async def cb_menu_bad(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     str_cid = cb.data.split(":")[1]
     words = db.get("bad_words", {}).get(str_cid, [])
@@ -1493,70 +1894,87 @@ async def cb_menu_bad(cb: CallbackQuery):
     if not words:
         text += "Список пуст.\nНажми 'Добавить', чтобы запретить слова!"
     else:
-        text += ", ".join([f"<code>{w}</code>" for w in words])
+        text += ", ".join(f"<code>{esc(w)}</code>" for w in words)
+        if len(text) > 3500:
+            text = text[:3500] + "…"
 
-    await cb.message.edit_text(text, reply_markup=kb_bad_menu(str_cid), parse_mode="HTML")
+    await safe_edit(cb, text, kb_bad_menu(str_cid), parse_mode="HTML")
     await cb.answer()
 
 @router.callback_query(F.data.startswith("add_bad:"))
 async def cb_add_bad_start(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     str_cid = cb.data.split(":")[1]
     await state.set_state(FormStates.waiting_for_bad_word)
     await state.update_data(target_cid=str_cid)
-    await cb.message.edit_text(
+    await safe_edit(
+        cb,
         "✏️ Напиши слово, которое бот должен удалять в чате:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отмена", callback_data=f"menu_bad:{str_cid}")]
-        ])
+        ]),
     )
     await cb.answer()
 
 @router.message(FormStates.waiting_for_bad_word)
 async def process_bad_word(m: Message, state: FSMContext):
-    if m.from_user.id != OWNER_ID or not m.text:
+    if not m.from_user or m.from_user.id != OWNER_ID or not m.text:
         return
     data = await state.get_data()
     str_cid = data.get("target_cid")
     word = m.text.strip().lower()
+    if not str_cid:
+        await state.clear()
+        return
+    if not word or len(word) > 64:
+        await m.reply("Слово должно быть от 1 до 64 символов. Пришли ещё раз.")
+        return
 
-    if str_cid not in db["bad_words"]:
-        db["bad_words"][str_cid] = []
-    if word not in db["bad_words"][str_cid]:
-        db["bad_words"][str_cid].append(word)
+    words = db["bad_words"].setdefault(str_cid, [])
+    if word not in words:
+        words.append(word)
         save_data()
     await state.clear()
 
     await m.reply(
-        f"✅ Слово <code>{word}</code> добавлено в запретный список!",
+        f"✅ Слово <code>{esc(word)}</code> добавлено в запретный список!",
         reply_markup=kb_bad_menu(str_cid),
         parse_mode="HTML"
     )
 
 @router.callback_query(F.data.startswith("del_bad:"))
 async def cb_del_bad(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        await cb.answer("не овнер", show_alert=True)
+    if not await owner_only(cb):
         return
     parts = cb.data.split(":")
     str_cid = parts[1]
-    word = parts[2]
-    if str_cid in db["bad_words"] and word in db["bad_words"][str_cid]:
-        db["bad_words"][str_cid].remove(word)
+    try:
+        idx = int(parts[2])
+    except (IndexError, ValueError):
+        await cb.answer()
+        return
+    words = db.get("bad_words", {}).get(str_cid, [])
+    if 0 <= idx < len(words):
+        words.pop(idx)
         save_data()
     await cb_menu_bad(cb)
 
 
 # ==================== СТАТИСТИКА ТАЙПЕРОВ ====================
 async def get_user_display_name(cid: int, uid: int) -> str:
+    key = (cid, uid)
+    now = time.monotonic()
+    hit = name_cache.get(key)
+    if hit and now - hit[1] < 3600:
+        return hit[0]
     try:
         cm = await bot.get_chat_member(cid, uid)
-        u = cm.user
-        return u.first_name or f"id{uid}"
+        name = cm.user.first_name or f"id{uid}"
     except Exception:
-        return f"id{uid}"
+        return f"id{uid}"  # сбой не кэшируем
+    name_cache[key] = (name, now)
+    return name
 
 @router.message(Command("typers", "тайперы"))
 async def cmd_typers(m: Message):
@@ -1590,7 +2008,15 @@ async def cmd_typers(m: Message):
 def fun_allowed(m: Message) -> bool:
     if m.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return False
-    return get_chat_cfg(m.chat.id).get("fun", True)
+    if not get_chat_cfg(m.chat.id).get("fun", True):
+        return False
+    # не чаще раза в 3 сек на человека — иначе бот упрётся во flood-limit Telegram
+    key = (m.chat.id, m.from_user.id if m.from_user else 0)
+    now = time.monotonic()
+    if now - fun_cooldown.get(key, -1e9) < 3:
+        return False
+    fun_cooldown[key] = now
+    return True
 
 def get_target_user(m: Message):
     if m.reply_to_message and m.reply_to_message.from_user:
@@ -1789,30 +2215,48 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     log.info(f"🌐 Anti-Sleep Web Server запущен на порту {port}")
+    return runner
 
 
 # ==================== АВТООЧИСТКА ПАМЯТИ ТРЕКЕРОВ РАЗ В 60 СЕК ====================
+def _prune_lists(tree: dict, cutoff: float, depth: int):
+    """Чистит вложенные словари со списками меток времени. depth = число уровней словарей минус 1."""
+    for k in list(tree.keys()):
+        v = tree[k]
+        if depth == 0:
+            nv = [t for t in v if t > cutoff]
+            if nv:
+                tree[k] = nv
+            else:
+                del tree[k]
+        else:
+            _prune_lists(v, cutoff, depth - 1)
+            if not v:
+                del tree[k]
+
 async def cleanup_memory_task():
-    """Каждые 60 секунд полностью удаляет устаревшие метки, чтобы исключить любое суммирование!"""
+    """Раз в минуту выбрасывает всё устаревшее, чтобы память не росла со временем."""
     while True:
         await asyncio.sleep(60)
         try:
             now = time.monotonic()
-            cutoff_15 = now - 15.0
+            _prune_lists(flood_text_tracker, now - 15, 2)
+            _prune_lists(flood_sticker_tracker, now - 15, 2)
+            _prune_lists(ban_word_tracker, now - 70, 1)
+            _prune_lists(kick_word_tracker, now - 70, 1)
+            _prune_lists(admin_kicks, now - MASS_KICK_WINDOW - 5, 1)
+            _prune_lists(join_tracker, now - JOIN_SHIELD_WINDOW - 5, 0)
 
-            for cid in list(flood_text_tracker.keys()):
-                for uid in list(flood_text_tracker[cid].keys()):
-                    for h in list(flood_text_tracker[cid][uid].keys()):
-                        flood_text_tracker[cid][uid][h] = [t for t in flood_text_tracker[cid][uid][h] if t > cutoff_15]
-                        if not flood_text_tracker[cid][uid][h]:
-                            del flood_text_tracker[cid][uid][h]
-
-            for cid in list(flood_sticker_tracker.keys()):
-                for uid in list(flood_sticker_tracker[cid].keys()):
-                    for s_id in list(flood_sticker_tracker[cid][uid].keys()):
-                        flood_sticker_tracker[cid][uid][s_id] = [t for t in flood_sticker_tracker[cid][uid][s_id] if t > cutoff_15]
-                        if not flood_sticker_tracker[cid][uid][s_id]:
-                            del flood_sticker_tracker[cid][uid][s_id]
+            for k in [k for k, v in admin_cache.items() if now - v[2] > 3600]:
+                del admin_cache[k]
+            for k in [k for k, v in name_cache.items() if now - v[1] > 3600]:
+                del name_cache[k]
+            for d, ttl in ((recent_demote, 60), (fun_cooldown, 60), (trigger_cooldown, 60),
+                           (tiktok_cooldown, 120), (notice_sent, 7200)):
+                for k in [k for k, t in d.items() if now - t > ttl]:
+                    del d[k]
+            for k in [k for k, t in join_pause_until.items() if t <= now]:
+                del join_pause_until[k]
         except Exception as e:
             log.warning(f"cleanup_memory_task error: {e}")
 
@@ -1821,44 +2265,41 @@ async def cleanup_memory_task():
 async def background_periodic_save():
     while True:
         await asyncio.sleep(120)
+        prune_stats()
         save_data()
 
 async def main():
     global BOT_ID, BOT_USERNAME
     load_data()
+    prune_stats()
     me = await bot.get_me()
     BOT_ID = me.id
     BOT_USERNAME = me.username or ""
     log.info(f"🚀 Бот запущен: @{BOT_USERNAME} [ID: {BOT_ID}]")
 
+    runner = None
     try:
-        await start_web_server()
+        runner = await start_web_server()
     except Exception as e:
         log.warning(f"Could not start anti-sleep web server: {e}")
 
     try:
-        await bot.send_message(
-            OWNER_ID,
-            f"🟢 <b>Бот @{BOT_USERNAME} v13 запущен!</b>\n"
-            f"• Полный иммунитет для гифок, фото и видео включён.\n"
-            f"• Монотонные часы + автоочистка памяти активны.\n"
-            f"• Ложные срабатывания исключены на 100%."
-        )
+        await bot.send_message(OWNER_ID, f"🟢 <b>Бот @{BOT_USERNAME} v14 запущен!</b>\n/start — настройки чатов", parse_mode="HTML")
     except Exception as e:
         log.warning(f"Could not send startup message to owner: {e}")
 
-    asyncio.create_task(background_periodic_save())
-    asyncio.create_task(cleanup_memory_task())
+    spawn(background_periodic_save())
+    spawn(cleanup_memory_task())
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message",
-            "chat_member",
-            "my_chat_member",
-            "callback_query",
-        ],
-    )
+    try:
+        # типы апдейтов собираются из зарегистрированных обработчиков
+        # (message, chat_member, my_chat_member, callback_query, chat_join_request)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        save_data()
+        if runner is not None:
+            await runner.cleanup()
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
